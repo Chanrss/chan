@@ -1,0 +1,141 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function isOwner() {
+      return isAuthenticated() && (
+        !exists(/databases/$(database)/documents/users/$(request.auth.uid)) ||
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.roleId == 'owner' || 
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.roleId == 'OWNER'
+      );
+    }
+    
+    function isManagerOrOwner() {
+      return isAuthenticated() && (
+        !exists(/databases/$(database)/documents/users/$(request.auth.uid)) ||
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.roleId == 'owner' || 
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.roleId == 'OWNER' ||
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.roleId == 'manager' || 
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.roleId == 'MANAGER'
+      );
+    }
+
+    // Allow initial user creation if no user exists or self-profile management
+    match /users/{userId} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated() && (request.auth.uid == userId || isOwner());
+      allow update: if isAuthenticated() && (request.auth.uid == userId || isOwner());
+      allow delete: if isOwner();
+    }
+    
+    match /roles/{roleId} {
+      allow read: if isAuthenticated();
+      allow write: if isAuthenticated();
+    }
+
+    match /permissions/{permissionId} {
+      allow read: if isAuthenticated();
+      allow write: if isOwner();
+    }
+
+    match /settings/{settingId} {
+      allow read: if true;
+      allow write: if isAuthenticated();
+    }
+
+    match /categories/{categoryId} {
+      allow read: if true;
+      allow write: if isAuthenticated();
+    }
+
+    match /menu_items/{itemId} {
+      allow read: if true;
+      allow write: if isAuthenticated();
+    }
+
+    match /kots/{kotId} {
+      allow read: if isAuthenticated();
+      allow create, update: if isAuthenticated();
+      allow delete: if isOwner();
+    }
+
+    match /kot_items/{itemId} {
+      allow read: if isAuthenticated();
+      allow create, update: if isAuthenticated();
+      allow delete: if isOwner();
+    }
+
+    match /bills/{billId} {
+      allow read: if isAuthenticated();
+      allow create, update: if isAuthenticated();
+      allow delete: if false; // Bills are never deleted
+    }
+
+    match /billing_drafts/{draftId} {
+      allow read, write: if isAuthenticated();
+    }
+
+    match /bill_items/{itemId} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated();
+      allow update, delete: if false; // Historical bill items are immutable
+    }
+
+    match /business_days/{dayId} {
+      allow read: if isAuthenticated();
+      allow write: if isAuthenticated();
+    }
+
+    match /bill_counters/{counterId} {
+      allow read, write: if isAuthenticated();
+    }
+
+    match /inventory_items/{itemId} {
+      allow read: if isAuthenticated();
+      allow write: if isAuthenticated();
+    }
+
+    match /inventory_movements/{movementId} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated();
+      allow update, delete: if isOwner();
+    }
+
+    match /purchases/{purchaseId} {
+      allow read: if isAuthenticated();
+      allow write: if isAuthenticated();
+    }
+
+    match /purchase_items/{itemId} {
+      allow read: if isAuthenticated();
+      allow write: if isAuthenticated();
+    }
+
+    match /stock_adjustments/{adjId} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated();
+      allow update, delete: if isOwner();
+    }
+
+    match /wastage/{wastageId} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated();
+      allow update, delete: if isOwner();
+    }
+
+    match /audit_logs/{logId} {
+      allow read: if isOwner();
+      allow create: if isAuthenticated();
+      allow update, delete: if false; // Logs cannot be modified
+    }
+
+    match /sync_metadata/{metaId} {
+      allow read, write: if isAuthenticated();
+    }
+  }
+}

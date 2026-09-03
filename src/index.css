@@ -1,0 +1,212 @@
+@import "tailwindcss";
+
+/* HTML & Body root responsive and smooth touch scrolling */
+html, body {
+  height: 100%;
+  min-height: 100%;
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior-y: contain;
+}
+
+#root {
+  min-height: 100%;
+  height: 100%;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Touch friendly interaction improvements */
+button, input, select, textarea {
+  touch-action: manipulation;
+}
+
+/* Custom scrollbars for high-density POS terminals */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.4);
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(100, 116, 139, 0.6);
+}
+
+/* 1. Default (Screen): Ensure #pos-print-root is strictly hidden during standard application view */
+#pos-print-root {
+  display: none !important;
+}
+
+@media print {
+  /* Hide standard web application UI, modals, buttons, and navigation during print */
+  body.pos-printing #root,
+  body.print-ready #root,
+  body:has(#pos-print-root:not(:empty)) > #root,
+  header, 
+  aside, 
+  button, 
+  nav, 
+  .no-print {
+    display: none !important;
+  }
+  
+  /* Dedicated POS Thermal Print Root Container - Visible ONLY when body is print-ready / pos-printing */
+  body.print-ready #pos-print-root,
+  body.pos-printing #pos-print-root,
+  body #pos-print-root[data-print-ready="true"],
+  body:has(#pos-print-root:not(:empty)) #pos-print-root {
+    display: block !important;
+    position: static !important;
+    width: 100% !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    background: white !important;
+    color: black !important;
+    z-index: 999999 !important;
+  }
+
+  body {
+    background-color: white !important;
+    color: black !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    -webkit-print-color-adjust: exact !important;
+    print-color-adjust: exact !important;
+  }
+
+  @page {
+    margin: 0;
+    size: auto;
+  }
+
+  /* Thermal Receipt Specific Styling inside print root */
+  #pos-print-root {
+    --receipt-base-font-size: 12px;
+    --receipt-title-font-size: calc(var(--receipt-base-font-size) * 1.25);
+    --receipt-header-font-size: calc(var(--receipt-base-font-size) * 0.88);
+    --receipt-meta-font-size: calc(var(--receipt-base-font-size) * 0.85);
+    --receipt-item-font-size: var(--receipt-base-font-size);
+    --receipt-total-font-size: calc(var(--receipt-base-font-size) * 1.25);
+    --receipt-small-font-size: calc(var(--receipt-base-font-size) * 0.75);
+    font-size: var(--receipt-base-font-size, 12px) !important;
+  }
+
+  .receipt-wrapper {
+    position: relative;
+    width: 100%;
+    margin: 0 auto;
+    background: #fff;
+    color: #000;
+    font-family: 'Mukta Malar', 'Noto Sans Tamil', 'Courier New', Courier, monospace;
+    font-size: var(--receipt-base-font-size, 12px);
+    line-height: 1.3;
+  }
+
+  .watermark {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    opacity: 0.10 !important;
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  .content {
+    position: relative;
+    z-index: 1;
+  }
+
+  .center { text-align: center; }
+  .bold { font-weight: bold; }
+  .header { text-align: center; margin-bottom: 6px; }
+  .receipt-logo-container {
+    text-align: center;
+    margin-bottom: 4px;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+  }
+  .receipt-logo {
+    max-width: 150px;
+    max-height: 65px;
+    object-fit: contain;
+    display: block;
+    margin: 0 auto;
+    filter: grayscale(100%) contrast(140%) !important;
+    -webkit-filter: grayscale(100%) contrast(140%) !important;
+  }
+  .restaurant-title { 
+    font-size: var(--receipt-title-font-size, 15px);
+    font-weight: 900; 
+    margin-bottom: 2px; 
+    letter-spacing: 0.5px;
+    text-transform: uppercase; 
+  }
+  .header-slogan {
+    font-size: var(--receipt-header-font-size, 10.5px);
+    font-weight: 600;
+    margin-bottom: 3px;
+    font-style: italic;
+  }
+  .contact-info {
+    font-size: var(--receipt-meta-font-size, 10px);
+    line-height: 1.35;
+    color: #222;
+  }
+  .tax-info {
+    font-size: var(--receipt-meta-font-size, 9.5px);
+    margin-top: 2px;
+    font-weight: 600;
+  }
+  .divider-solid { border-top: 1.5px solid #000; margin: 4px 0; }
+  .divider-double { border-top: 3px double #000; margin: 4px 0; }
+  .divider-dashed { border-top: 1px dashed #000; margin: 4px 0; }
+  .meta-table, .items-table, .totals-table { 
+    width: 100%; 
+    border-collapse: collapse; 
+    font-size: var(--receipt-base-font-size, 12px); 
+  }
+  .meta-table td { 
+    padding: 1.5px 0; 
+    vertical-align: top; 
+    font-size: var(--receipt-meta-font-size, 10.5px); 
+  }
+  .items-table th { 
+    border-top: 1px dashed #000;
+    border-bottom: 1px dashed #000; 
+    padding: 3px 0; 
+    text-align: left; 
+    font-weight: 800;
+    font-size: var(--receipt-meta-font-size, 10.5px);
+  }
+  .totals-table td { padding: 1.5px 0; }
+  .grand-total-row { 
+    font-size: var(--receipt-total-font-size, 15px);
+    font-weight: 900; 
+  }
+  .summary-qty {
+    font-size: var(--receipt-small-font-size, 9.5px);
+    color: #333;
+    padding-bottom: 3px;
+  }
+  .footer { 
+    text-align: center; 
+    margin-top: 8px; 
+    font-size: var(--receipt-meta-font-size, 10.5px);
+    line-height: 1.35;
+  }
+  .footer-note {
+    font-weight: 700;
+    margin-bottom: 2px;
+  }
+}
+
