@@ -1,6 +1,6 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { PrinterService } from './printerService';
-import { Bill, BillItem, Kot, RestaurantSettings } from '../types';
+import { Bill, BillItem, Kot, KotItem, RestaurantSettings } from '../types';
 
 describe('PrinterService thermal receipt formatting', () => {
   const sampleBill: Bill = {
@@ -139,5 +139,116 @@ describe('PrinterService thermal receipt formatting', () => {
 
     PrinterService.setMockPrintMode(false);
     expect(PrinterService.isMockPrintMode()).toBe(false);
+  });
+
+  it('generates standardized diagnostic string verifying connection and paper feed status', () => {
+    const diagnosticString = PrinterService.getStandardizedDiagnosticString(sampleSettings);
+
+    expect(diagnosticString).toContain('STANDARDIZED PRINTER DIAGNOSTIC TEST');
+    expect(diagnosticString).toContain('STATUS       : ONLINE / CONNECTED');
+    expect(diagnosticString).toContain('PAPER FEED   : VERIFIED / ACTIVE');
+    expect(diagnosticString).toContain('FEED TEST    : 20MM ADVANCE OK');
+    expect(diagnosticString).toContain('STANDARDIZED DIAGNOSTIC TEST STRING:');
+    expect(diagnosticString).toContain('0123456789 ABCDEFGHIJKLMNOPQRSTUVWXYZ');
+    expect(diagnosticString).toContain('*** CONNECTION & PAPER FEED VERIFIED ***');
+  });
+
+  it('generates diagnostic test slip HTML with connection status, character set, and 20mm paper feed', () => {
+    const html = PrinterService.generateDiagnosticTestSlipHTML(sampleSettings);
+
+    expect(html).toContain('PRINTER DIAGNOSTIC');
+    expect(html).toContain('STANDARDIZED TEST PAGE');
+    expect(html).toContain('ONLINE / CONNECTED');
+    expect(html).toContain('PASSED / 20MM FEED');
+    expect(html).toContain('STANDARDIZED DIAGNOSTIC STRING');
+    expect(html).toContain('THERMAL HEAD DENSITY');
+    expect(html).toContain('height: 20mm');
+    expect(html).toContain('CONNECTION & FEED VERIFIED');
+  });
+
+  it('ensures printHtmlDocument uses consistent window.print() trigger compatible with Chrome Kiosk Printing', () => {
+    const printSpy = vi.fn();
+    window.print = printSpy;
+    const focusSpy = vi.fn();
+    window.focus = focusSpy;
+    const popupSpy = vi.spyOn(window, 'open');
+
+    const result = PrinterService.printHtmlDocument('<div>Receipt Content</div>', sampleSettings);
+
+    expect(result.success).toBe(true);
+    expect(printSpy).toHaveBeenCalledTimes(1);
+    expect(focusSpy).toHaveBeenCalledTimes(1);
+    expect(popupSpy).not.toHaveBeenCalled();
+
+    const printRoot = document.getElementById('pos-print-root');
+    expect(printRoot).not.toBeNull();
+  });
+
+  it('ensures printBill executes consistent window.print() trigger without opening popups or dialogs', () => {
+    const printSpy = vi.fn();
+    window.print = printSpy;
+    const popupSpy = vi.spyOn(window, 'open');
+
+    const result = PrinterService.printBill(sampleBill, sampleItems, sampleSettings, true);
+
+    expect(result.success).toBe(true);
+    expect(printSpy).toHaveBeenCalledTimes(1);
+    expect(popupSpy).not.toHaveBeenCalled();
+  });
+
+  it('ensures printKot executes consistent window.print() trigger without opening popups or dialogs', () => {
+    const printSpy = vi.fn();
+    window.print = printSpy;
+    const popupSpy = vi.spyOn(window, 'open');
+
+    const kot: Kot = {
+      id: 'kot-2',
+      kotNumber: 'KOT-99',
+      businessDate: '2026-08-28',
+      orderType: 'DINE_IN',
+      tableNumber: 'T-1',
+      waiterId: 'w-1',
+      createdBy: 'Staff',
+      status: 'OPEN',
+      itemsCount: 1,
+      createdAt: Date.now(),
+      updatedAt: Date.now()
+    };
+    const kotItems: KotItem[] = [
+      {
+        id: 'ki-2',
+        kotId: 'kot-2',
+        itemId: 'm2',
+        itemCode: '202',
+        itemName: 'Poori Masala',
+        quantity: 1,
+        priceType: 'NON_AC' as const,
+        unitPrice: 60,
+        createdAt: Date.now(),
+        updatedAt: Date.now()
+      }
+    ];
+
+    const result = PrinterService.printKot(kot, kotItems, true);
+
+    expect(result.success).toBe(true);
+    expect(printSpy).toHaveBeenCalledTimes(1);
+    expect(popupSpy).not.toHaveBeenCalled();
+  });
+
+  it('ensures printViaIframe and printViaDirectDOM both route through the consistent window.print() trigger', () => {
+    const printSpy = vi.fn();
+    window.print = printSpy;
+    const popupSpy = vi.spyOn(window, 'open');
+
+    const res1 = PrinterService.printViaIframe('<div>Test Iframe Call</div>');
+    expect(res1.success).toBe(true);
+    expect(printSpy).toHaveBeenCalledTimes(1);
+
+    const res2 = PrinterService.printViaDirectDOM('<div>Test Direct DOM Call</div>');
+    expect(res2.success).toBe(true);
+    expect(printSpy).toHaveBeenCalledTimes(2);
+
+    expect(popupSpy).not.toHaveBeenCalled();
   });
 });

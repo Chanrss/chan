@@ -22,6 +22,7 @@ import {
 } from '../types';
 import { allocateNextBillNumber, getBusinessDate } from './billNumberEngine';
 import { recordInventorySale } from './inventoryEngine';
+import { saveBillLocally, updateLocalBill } from './localBillStore';
 
 export class BillingEngine {
   /**
@@ -54,6 +55,74 @@ export class BillingEngine {
    */
   static getApplicablePrice(item: MenuItem, priceType: PriceType): number {
     return priceType === 'AC' ? (item.acPrice || 0) : (item.nonAcPrice || 0);
+  }
+
+  /**
+   * Calculates line total for a menu item given quantity and price type
+   */
+  static calculateLineTotal(item: MenuItem, quantity: number, priceType: PriceType): number {
+    const unitPrice = BillingEngine.getApplicablePrice(item, priceType);
+    return BillingEngine.calculateItemTotal(unitPrice, quantity);
+  }
+
+  /**
+   * Synchronously prepares bill and bill items for instant direct printing
+   */
+  static prepareBillForDirectPrint(
+    items: CartItem[],
+    orderType: OrderType,
+    priceType: PriceType,
+    tableNumber: string,
+    discount: number,
+    paymentMethod: string,
+    userName: string,
+    userId: string,
+    billNumber: string,
+    businessDate: string
+  ): { bill: Bill; items: BillItem[] } {
+    const subtotal = BillingEngine.calculateSubtotal(items);
+    const grandTotal = BillingEngine.calculateGrandTotal(subtotal, discount);
+    const billId = `bill_${businessDate}_${billNumber}_${Date.now()}`;
+    const now = Date.now();
+
+    const bill: Bill = {
+      id: billId,
+      businessDate,
+      billNumber,
+      orderType,
+      priceType,
+      tableNumber,
+      userId,
+      userName,
+      paymentMethod,
+      subtotal,
+      discount,
+      grandTotal,
+      status: 'COMPLETED',
+      reprintCount: 0,
+      createdAt: now,
+      updatedAt: now
+    };
+
+    const billItems: BillItem[] = items.map((cartItem, idx) => ({
+      id: `${billId}_item_${idx + 1}`,
+      billId,
+      itemId: cartItem.itemId,
+      itemCode: cartItem.itemCode,
+      itemName: cartItem.itemName,
+      itemNameTamil: cartItem.itemNameTamil,
+      quantity: cartItem.quantity,
+      unitPrice: cartItem.unitPrice,
+      totalPrice: cartItem.totalPrice,
+      priceType: cartItem.priceType,
+      businessDate,
+      createdAt: now
+    }));
+
+    return {
+      bill: { ...bill, items: billItems },
+      items: billItems
+    };
   }
 
   /**
@@ -144,10 +213,25 @@ export class BillingEngine {
   }
 
   /**
-   * Persists bill to Firestore and handles inventory stock updates.
+   * Persists bill to local storage and Firestore, handling inventory stock updates.
    * Can be run in background without blocking the UI or printer.
    */
   static async persistBillAsync(bill: Bill, billItems: BillItem[], kotId?: string, userId?: string): Promise<void> {
+    // 1. Immediately save to resilient local POS store so bill history, reprints, and reports always have the bill
+    try {
+      saveBillLocally(bill, billItems, kotId);
+    } catch (localErr) {
+      console.warn('Local bill save notice:', localErr);
+    }
+
+    // 2. Deduct stock from inventory in background
+    if (userId) {
+      recordInventorySale(billItems, userId).catch((err) => {
+        console.warn('Inventory deduction notice:', err);
+      });
+    }
+
+    // 3. Persist to Firestore in cloud
     try {
       const batch = writeBatch(db);
 
@@ -171,25 +255,19 @@ export class BillingEngine {
       }
 
       await batch.commit();
-
-      // Deduct stock from inventory in background
-      if (userId) {
-        recordInventorySale(billItems, userId).catch((err) => {
-          console.warn('Inventory deduction notice:', err);
-        });
-      }
-    } catch (err) {
-      console.error('Background bill persist error:', err);
-      // Cache in localStorage for automatic recovery if offline
+    } catch (err: any) {
+      // If Firestore reports permission restriction or offline status, queue for sync without crashing POS
+      console.warn('Background Firestore persist notice (bill preserved in local storage):', err?.message || err);
       try {
         const pendingKey = `pos_pending_bills_${bill.businessDate}`;
         const existing = JSON.parse(localStorage.getItem(pendingKey) || '[]');
-        existing.push({ bill, items: billItems, kotId, userId, timestamp: Date.now() });
-        localStorage.setItem(pendingKey, JSON.stringify(existing));
+        if (!existing.some((p: any) => p.bill?.id === bill.id)) {
+          existing.push({ bill, items: billItems, kotId, userId, timestamp: Date.now() });
+          localStorage.setItem(pendingKey, JSON.stringify(existing));
+        }
       } catch (storageErr) {
         console.warn('LocalStorage queue notice:', storageErr);
       }
-      throw err;
     }
   }
 
@@ -225,19 +303,30 @@ export class BillingEngine {
    * Cancels a bill without physically deleting it from Firestore.
    */
   static async cancelBill(billId: string, reason: string, cancelledBy: string): Promise<void> {
-    const billRef = doc(db, 'bills', billId);
-    const billSnap = await getDoc(billRef);
-    if (!billSnap.exists()) {
-      throw new Error('Bill not found');
-    }
-
-    await updateDoc(billRef, {
-      status: 'CANCELLED',
+    const cancelData = {
+      status: 'CANCELLED' as const,
       cancelReason: reason || 'Cancelled by staff',
       cancelledBy,
       cancelledAt: Date.now(),
       updatedAt: Date.now()
-    });
+    };
+
+    // 1. Update in local storage
+    const updatedLocally = updateLocalBill(billId, cancelData);
+
+    // 2. Try updating in Firestore
+    try {
+      const billRef = doc(db, 'bills', billId);
+      const billSnap = await getDoc(billRef);
+      if (billSnap.exists()) {
+        await updateDoc(billRef, cancelData);
+      }
+    } catch (e) {
+      console.warn('Could not update cancelled status in Firestore (updated locally):', e);
+      if (!updatedLocally) {
+        throw e;
+      }
+    }
   }
 
   /**

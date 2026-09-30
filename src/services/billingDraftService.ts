@@ -165,3 +165,9 @@ export async function clearBillingDraft(
     console.warn('Firestore clear draft notice:', firestoreErr);
   }
 }
+
+/**
+ * Backward-compatible alias for getBillingDraft
+ */
+export const loadBillingDraft = getBillingDraft;
+

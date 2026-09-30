@@ -9,6 +9,7 @@ import {
 } from 'firebase/firestore';
 import { getAuth } from 'firebase/auth';
 import { getStorage } from 'firebase/storage';
+import { safeStorage } from '../utils/safeStorage';
 import firebaseConfig from '../../firebase-applet-config.json';
 
 // Initialize Firebase App
@@ -38,12 +39,59 @@ export const auth = getAuth(app);
 export const storage = getStorage(app);
 export { db, enableNetwork, disableNetwork };
 
+export enum OperationType {
+  CREATE = 'create',
+  UPDATE = 'update',
+  DELETE = 'delete',
+  LIST = 'list',
+  GET = 'get',
+  WRITE = 'write',
+}
+
+export interface FirestoreErrorInfo {
+  error: string;
+  operationType: OperationType;
+  path: string | null;
+  authInfo: {
+    userId?: string | null;
+    email?: string | null;
+    emailVerified?: boolean | null;
+    isAnonymous?: boolean | null;
+    tenantId?: string | null;
+    providerInfo?: {
+      providerId?: string | null;
+      email?: string | null;
+    }[];
+  };
+}
+
+export function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null) {
+  const errInfo: FirestoreErrorInfo = {
+    error: error instanceof Error ? error.message : String(error),
+    authInfo: {
+      userId: auth.currentUser?.uid,
+      email: auth.currentUser?.email,
+      emailVerified: auth.currentUser?.emailVerified,
+      isAnonymous: auth.currentUser?.isAnonymous,
+      tenantId: auth.currentUser?.tenantId,
+      providerInfo: auth.currentUser?.providerData?.map(provider => ({
+        providerId: provider.providerId,
+        email: provider.email,
+      })) || []
+    },
+    operationType,
+    path
+  };
+  console.warn('Firestore Operation Notice [' + operationType + ' ' + (path || '') + ']:', JSON.stringify(errInfo));
+  return errInfo;
+}
+
 // Device ID management for offline transaction idempotency
 export function getDeviceId(): string {
-  let deviceId = localStorage.getItem('pos_device_id');
+  let deviceId = safeStorage.getItem('pos_device_id');
   if (!deviceId) {
     deviceId = 'POS-' + Math.random().toString(36).substring(2, 8).toUpperCase();
-    localStorage.setItem('pos_device_id', deviceId);
+    safeStorage.setItem('pos_device_id', deviceId);
   }
   return deviceId;
 }

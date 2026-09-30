@@ -2,6 +2,7 @@ import { collection, getDocs, query, where, orderBy } from 'firebase/firestore';
 import { db } from './firebase';
 import { Bill, BillItem, Category, InventoryItem, Purchase } from '../types';
 import * as XLSX from 'xlsx';
+import { getLocalBills, getLocalBillItems, mergeBills } from './localBillStore';
 
 export interface ReportFilter {
   startDate: string; // YYYY-MM-DD
@@ -41,15 +42,26 @@ export class ReportEngine {
    * Fetches bills within date range
    */
   static async fetchBillsInRange(startDate: string, endDate: string): Promise<Bill[]> {
-    const q = query(
-      collection(db, 'bills'),
-      where('businessDate', '>=', startDate),
-      where('businessDate', '<=', endDate),
-      orderBy('businessDate', 'asc'),
-      orderBy('createdAt', 'asc')
+    let remoteBills: Bill[] = [];
+    try {
+      const q = query(
+        collection(db, 'bills'),
+        where('businessDate', '>=', startDate),
+        where('businessDate', '<=', endDate),
+        orderBy('businessDate', 'asc'),
+        orderBy('createdAt', 'asc')
+      );
+      const snap = await getDocs(q);
+      remoteBills = snap.docs.map((d) => ({ id: d.id, ...d.data() } as Bill));
+    } catch (e) {
+      console.warn('Firestore fetchBillsInRange notice (using local bills):', e);
+    }
+
+    const localBills = getLocalBills().filter(
+      (b) => b.businessDate >= startDate && b.businessDate <= endDate
     );
-    const snap = await getDocs(q);
-    return snap.docs.map((d) => ({ id: d.id, ...d.data() } as Bill));
+
+    return mergeBills(remoteBills, localBills);
   }
 
   /**
@@ -58,20 +70,40 @@ export class ReportEngine {
   static async fetchBillItemsInRange(billIds: string[]): Promise<BillItem[]> {
     if (!billIds || billIds.length === 0) return [];
     
-    // Firestore where in is limited to 30 per batch, so fetch in chunks
-    const chunks: string[][] = [];
-    for (let i = 0; i < billIds.length; i += 30) {
-      chunks.push(billIds.slice(i, i + 30));
+    const allItems: BillItem[] = [];
+    const foundBillIds = new Set<string>();
+
+    try {
+      // Firestore where in is limited to 30 per batch, so fetch in chunks
+      const chunks: string[][] = [];
+      for (let i = 0; i < billIds.length; i += 30) {
+        chunks.push(billIds.slice(i, i + 30));
+      }
+
+      for (const chunk of chunks) {
+        const q = query(
+          collection(db, 'bill_items'),
+          where('billId', 'in', chunk)
+        );
+        const snap = await getDocs(q);
+        snap.docs.forEach((doc) => {
+          const item = { id: doc.id, ...doc.data() } as BillItem;
+          allItems.push(item);
+          foundBillIds.add(item.billId);
+        });
+      }
+    } catch (e) {
+      console.warn('Firestore fetchBillItemsInRange notice (using local bill items):', e);
     }
 
-    const allItems: BillItem[] = [];
-    for (const chunk of chunks) {
-      const q = query(
-        collection(db, 'bill_items'),
-        where('billId', 'in', chunk)
-      );
-      const snap = await getDocs(q);
-      snap.docs.forEach((doc) => allItems.push({ id: doc.id, ...doc.data() } as BillItem));
+    // For any billId not retrieved from remote Firestore, get from local store
+    for (const id of billIds) {
+      if (!foundBillIds.has(id)) {
+        const localItems = getLocalBillItems(id);
+        if (localItems && localItems.length > 0) {
+          allItems.push(...localItems);
+        }
+      }
     }
 
     return allItems;

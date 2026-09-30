@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
+import { motion, AnimatePresence } from 'motion/react';
 import { 
   Zap, 
   Plus, 
@@ -24,20 +25,26 @@ import {
   Coffee,
   Receipt,
   X,
-  Cloud
+  Cloud,
+  ChefHat
 } from 'lucide-react';
 import { useAuth } from '../../context/AuthContext';
-import { CartItem, MenuItem, OrderType, PriceType, RestaurantSettings, Bill, BillItem } from '../../types';
+import { CartItem, MenuItem, OrderType, PriceType, RestaurantSettings, Bill, BillItem, Kot, KotItem } from '../../types';
 import { BillingEngine } from '../../services/billingEngine';
 import { PrinterService } from '../../services/printerService';
-import { getBusinessDate, syncBusinessDaySequence } from '../../services/billNumberEngine';
+import { getBusinessDate, syncBusinessDaySequence, allocateNextKotNumber } from '../../services/billNumberEngine';
 import { ThermalReceiptModal } from '../common/ThermalReceiptModal';
-import { collection, onSnapshot, query, orderBy, limit, getDocs } from 'firebase/firestore';
-import { db } from '../../services/firebase';
+import { DirectHardwarePrintModal } from '../common/DirectHardwarePrintModal';
+import { PrinterConnectionService } from '../../services/printerConnectionService';
+import { collection, onSnapshot, query, orderBy, limit, getDocs, doc, writeBatch } from 'firebase/firestore';
+import { db, sanitizeForFirestore } from '../../services/firebase';
+import { saveKotLocally, updateLocalKotStatus } from '../../services/localKotStore';
 import { DEFAULT_FALLBACK_MENU_ITEMS, DEFAULT_CATEGORIES } from '../../data/fallbackMenu';
 import { useMenuSearch } from '../../hooks/useMenuSearch';
 import { saveBillingDraft, getBillingDraft, clearBillingDraft } from '../../services/billingDraftService';
 import { ReprintEngine } from '../../services/reprintEngine';
+import { safeStorage } from '../../utils/safeStorage';
+import { DEFAULT_RESTAURANT_LOGO, SRI_SARAVANA_BHAVAN_SVG } from '../../data/defaultLogo';
 
 interface DirectBillingProps {
   settings?: RestaurantSettings;
@@ -66,7 +73,7 @@ export const DirectBilling: React.FC<DirectBillingProps> = ({ settings }) => {
 
   // High-Speed Rush Mode (Default: ON for instant printing and immediate next-customer reset)
   const [fastRushMode, setFastRushMode] = useState<boolean>(() => {
-    return localStorage.getItem('pos_fast_rush_mode') !== 'false';
+    return safeStorage.getItem('pos_fast_rush_mode') !== 'false';
   });
   
   // Hardware vs Mock Print Mode
@@ -75,7 +82,7 @@ export const DirectBilling: React.FC<DirectBillingProps> = ({ settings }) => {
   });
   const [lastPrintedBill, setLastPrintedBill] = useState<{ bill: Bill; items: BillItem[] } | null>(() => {
     try {
-      const cached = localStorage.getItem('pos_last_printed_bill');
+      const cached = safeStorage.getItem('pos_last_printed_bill');
       if (cached) return JSON.parse(cached);
     } catch (e) {}
     return null;
@@ -107,6 +114,7 @@ export const DirectBilling: React.FC<DirectBillingProps> = ({ settings }) => {
   const [priceTypeChoice, setPriceTypeChoice] = useState<'1' | '2'>('1');
   const [orderTypeChoice, setOrderTypeChoice] = useState<'1' | '2'>('1');
   const [tableNumber, setTableNumber] = useState('');
+  const [activeKotId, setActiveKotId] = useState<string | undefined>(undefined);
   const [discountPercent, setDiscountPercent] = useState<number | null>(null);
   const [customDiscount, setCustomDiscount] = useState<number>(0);
   const [cart, setCart] = useState<EnhancedCartItem[]>([]);
@@ -137,9 +145,24 @@ export const DirectBilling: React.FC<DirectBillingProps> = ({ settings }) => {
   const [savedBill, setSavedBill] = useState<Bill | null>(null);
   const [savedBillItems, setSavedBillItems] = useState<BillItem[]>([]);
   const [isReceiptModalOpen, setIsReceiptModalOpen] = useState(false);
+  const [isHardwareModalOpen, setIsHardwareModalOpen] = useState(false);
   const [searchModalOpen, setSearchModalOpen] = useState(false);
+  const [connectedPrinter, setConnectedPrinter] = useState(PrinterConnectionService.getConnectedPrinter());
   const [searchQuery, setSearchQuery] = useState('');
   const [activeItemNoteIdx, setActiveItemNoteIdx] = useState<number | null>(null);
+
+  // Synchronize connected printer state periodically
+  useEffect(() => {
+    const updatePrinter = () => {
+      setConnectedPrinter(PrinterConnectionService.getConnectedPrinter());
+    };
+    window.addEventListener('storage', updatePrinter);
+    const interval = setInterval(updatePrinter, 2500);
+    return () => {
+      window.removeEventListener('storage', updatePrinter);
+      clearInterval(interval);
+    };
+  }, []);
 
   // Active Focused Step Tracker for visual clarity
   const [focusedStep, setFocusedStep] = useState<'PRICE_TYPE' | 'ORDER_TYPE' | 'ITEM_CODE' | 'QUANTITY'>('PRICE_TYPE');
@@ -228,9 +251,15 @@ export const DirectBilling: React.FC<DirectBillingProps> = ({ settings }) => {
     };
   }, [currentUser?.uid]);
 
-  // Effective Menu Items
+  // Effective Menu Items (Respects manual entry and empty state from Menu Management)
   const menuItems = useMemo(() => {
-    return firestoreMenuItems.length > 0 ? firestoreMenuItems : DEFAULT_FALLBACK_MENU_ITEMS;
+    try {
+      const stored = localStorage.getItem('pos_local_menu_items');
+      if (stored !== null) {
+        return JSON.parse(stored);
+      }
+    } catch (e) {}
+    return firestoreMenuItems;
   }, [firestoreMenuItems]);
 
   // Available categories
@@ -241,9 +270,6 @@ export const DirectBilling: React.FC<DirectBillingProps> = ({ settings }) => {
         set.set(m.categoryId, m.categoryName);
       }
     });
-    if (set.size === 0) {
-      DEFAULT_CATEGORIES.forEach((c) => set.set(c.id, c.categoryName));
-    }
     return Array.from(set.entries()).map(([id, name]) => ({ id, name }));
   }, [menuItems]);
 
@@ -302,18 +328,29 @@ export const DirectBilling: React.FC<DirectBillingProps> = ({ settings }) => {
     }
   }, [loadingMenu]);
 
-  // Global Keyboard shortcuts (Ctrl, Ctrl+Enter, Cmd+Enter, F2, F4, F8, F9, F10, ESC)
+  // Global Keyboard shortcuts (Ctrl alone, Ctrl+Enter, Cmd+Enter, F2, F4, F7, F8, F9, F10, ESC)
   useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      // Step 14: Single [CTRL] press OR [CTRL + ENTER] / [CMD + ENTER] / [CTRL + P] -> Validate, Save, Print & Start New Bill
-      const isCtrlKey = e.key === 'Control' || e.code === 'ControlLeft' || e.code === 'ControlRight';
-      const isCtrlEnter = (e.ctrlKey || e.metaKey) && (e.key === 'Enter' || e.key === 'p' || e.key === 'P');
+    let ctrlPressedAlone = false;
+    let ctrlPressStartTime = 0;
 
-      if (isCtrlKey || isCtrlEnter) {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      // Direct Hardware Print: Track if Ctrl or Cmd is tapped alone
+      if ((e.key === 'Control' || e.key === 'Meta') && !e.repeat) {
+        ctrlPressedAlone = true;
+        ctrlPressStartTime = Date.now();
+      } else if (e.key !== 'Control' && e.key !== 'Meta') {
+        // Any other key pressed while holding Ctrl indicates a combo or typing
+        ctrlPressedAlone = false;
+      }
+
+      // Step 14: Save & Print Combo: [CTRL + ENTER] / [CMD + ENTER] / [CTRL + P] / [CTRL + S]
+      const isSaveShortcut = (e.ctrlKey || e.metaKey) && (e.key === 'Enter' || e.key === 'p' || e.key === 'P' || e.key === 's' || e.key === 'S');
+
+      if (isSaveShortcut) {
         e.preventDefault();
         e.stopPropagation();
         if (cart.length === 0) {
-          setInputError('Cart is empty. Please add at least 1 item before saving (Ctrl).');
+          setInputError('Cart is empty. Please add at least 1 item before saving (Ctrl alone or Ctrl+Enter).');
           setTimeout(() => setInputError(null), 3000);
           return;
         }
@@ -336,7 +373,10 @@ export const DirectBilling: React.FC<DirectBillingProps> = ({ settings }) => {
       } else if (e.key === 'F8') {
         e.preventDefault();
         handleHoldBill();
-      } else if (e.key === 'F9' || e.key === 'F10') {
+      } else if (e.key === 'F9') {
+        e.preventDefault();
+        handleCreateKotFromBilling(true);
+      } else if (e.key === 'F10') {
         e.preventDefault();
         handleSaveBill(true, 'CASH');
       } else if (e.key === 'Escape') {
@@ -346,6 +386,8 @@ export const DirectBilling: React.FC<DirectBillingProps> = ({ settings }) => {
           setSearchModalOpen(false);
         } else if (isReceiptModalOpen) {
           setIsReceiptModalOpen(false);
+        } else if (isHardwareModalOpen) {
+          setIsHardwareModalOpen(false);
         } else if (activeItemNoteIdx !== null) {
           setActiveItemNoteIdx(null);
         } else if (selectedMenuItem || itemCodeInput) {
@@ -369,20 +411,54 @@ export const DirectBilling: React.FC<DirectBillingProps> = ({ settings }) => {
       }
     };
 
+    const handleKeyUp = (e: KeyboardEvent) => {
+      // If user tapped [Ctrl] or [Cmd] alone to immediately save and print
+      if ((e.key === 'Control' || e.key === 'Meta') && ctrlPressedAlone) {
+        ctrlPressedAlone = false;
+        const duration = Date.now() - ctrlPressStartTime;
+        // If released within 900ms without other keys pressed, execute instant hardware print
+        if (duration < 900) {
+          if (cart.length === 0) {
+            setInputError('Cart is empty. Add items first, then tap [Ctrl] to print immediately.');
+            setTimeout(() => setInputError(null), 3000);
+            return;
+          }
+          e.preventDefault();
+          e.stopPropagation();
+          handleSaveBill(true, 'CASH');
+        }
+      }
+    };
+
     window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [cart, priceType, orderType, tableNumber, customDiscount, discountPercent, searchModalOpen, isReceiptModalOpen, showSuggestions, activeItemNoteIdx, selectedMenuItem, itemCodeInput, focusedStep]);
+    window.addEventListener('keyup', handleKeyUp);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('keyup', handleKeyUp);
+    };
+  }, [cart, priceType, orderType, tableNumber, customDiscount, discountPercent, searchModalOpen, isReceiptModalOpen, isHardwareModalOpen, showSuggestions, activeItemNoteIdx, selectedMenuItem, itemCodeInput, focusedStep]);
+
+  // Listen for restricted browser print dialogs if logged by system
+  useEffect(() => {
+    const handlePrintRestricted = () => {
+      console.warn('Browser print restricted notice received.');
+    };
+
+    window.addEventListener('pos-print-restricted', handlePrintRestricted);
+    return () => window.removeEventListener('pos-print-restricted', handlePrintRestricted);
+  }, []);
 
   // STEP 2: Handle Price Type Input (1 = Non-AC, 2 = AC) -> Press Enter -> Moves to Order Type
   const handlePriceTypeKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    // Check for Ctrl / Ctrl+Enter save trigger
-    if (e.key === 'Control' || e.code === 'ControlLeft' || e.code === 'ControlRight' || ((e.ctrlKey || e.metaKey) && (e.key === 'Enter' || e.key === 'p' || e.key === 'P'))) {
+    // Check for Ctrl+Enter / Ctrl+P / Ctrl+S save trigger
+    const isSaveCombo = (e.ctrlKey || e.metaKey) && (e.key === 'Enter' || e.key === 'p' || e.key === 'P' || e.key === 's' || e.key === 'S');
+    if (isSaveCombo) {
       e.preventDefault();
       e.stopPropagation();
       if (cart.length > 0) {
         handleSaveBill(true, 'CASH');
       } else {
-        setInputError('Cart is empty. Please add items before saving.');
+        setInputError('Cart is empty. Please add items before saving (Ctrl+Enter or F10).');
         setTimeout(() => setInputError(null), 3000);
       }
       return;
@@ -413,14 +489,15 @@ export const DirectBilling: React.FC<DirectBillingProps> = ({ settings }) => {
 
   // STEP 3: Handle Order Type Input (1 = Dine In, 2 = Take Away) -> Press Enter -> Moves to Item Code
   const handleOrderTypeKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    // Check for Ctrl / Ctrl+Enter save trigger
-    if (e.key === 'Control' || e.code === 'ControlLeft' || e.code === 'ControlRight' || ((e.ctrlKey || e.metaKey) && (e.key === 'Enter' || e.key === 'p' || e.key === 'P'))) {
+    // Check for Ctrl+Enter / Ctrl+P / Ctrl+S save trigger
+    const isSaveCombo = (e.ctrlKey || e.metaKey) && (e.key === 'Enter' || e.key === 'p' || e.key === 'P' || e.key === 's' || e.key === 'S');
+    if (isSaveCombo) {
       e.preventDefault();
       e.stopPropagation();
       if (cart.length > 0) {
         handleSaveBill(true, 'CASH');
       } else {
-        setInputError('Cart is empty. Please add items before saving.');
+        setInputError('Cart is empty. Please add items before saving (Ctrl+Enter or F10).');
         setTimeout(() => setInputError(null), 3000);
       }
       return;
@@ -468,14 +545,15 @@ export const DirectBilling: React.FC<DirectBillingProps> = ({ settings }) => {
 
   // STEP 5: Handle Item Code Input KeyDown -> Enter -> Finds Item & Moves to Quantity (STEP 8)
   const handleItemCodeKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    // Check for Ctrl / Ctrl+Enter save trigger
-    if (e.key === 'Control' || e.code === 'ControlLeft' || e.code === 'ControlRight' || ((e.ctrlKey || e.metaKey) && (e.key === 'Enter' || e.key === 'p' || e.key === 'P'))) {
+    // Check for Ctrl+Enter / Ctrl+P / Ctrl+S save trigger
+    const isSaveCombo = (e.ctrlKey || e.metaKey) && (e.key === 'Enter' || e.key === 'p' || e.key === 'P' || e.key === 's' || e.key === 'S');
+    if (isSaveCombo) {
       e.preventDefault();
       e.stopPropagation();
       if (cart.length > 0) {
         handleSaveBill(true, 'CASH');
       } else {
-        setInputError('Cart is empty. Please add items before saving (Ctrl).');
+        setInputError('Cart is empty. Please add items before saving (Ctrl+Enter or F10).');
         setTimeout(() => setInputError(null), 3000);
       }
       return;
@@ -511,7 +589,7 @@ export const DirectBilling: React.FC<DirectBillingProps> = ({ settings }) => {
         if (cart.length > 0) {
           handleSaveBill(true, 'CASH');
         } else {
-          setInputError('Enter an item code or press Ctrl after adding items.');
+          setInputError('Enter an item code or press Ctrl+Enter / F10 after adding items.');
           setTimeout(() => setInputError(null), 3000);
         }
         return;
@@ -546,14 +624,15 @@ export const DirectBilling: React.FC<DirectBillingProps> = ({ settings }) => {
 
   // STEP 9 & 10: Handle Quantity Enter -> Add to Cart -> Return Focus to Item Code (STEP 12)
   const handleQuantityKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    // Check for Ctrl / Ctrl+Enter save trigger
-    if (e.key === 'Control' || e.code === 'ControlLeft' || e.code === 'ControlRight' || ((e.ctrlKey || e.metaKey) && (e.key === 'Enter' || e.key === 'p' || e.key === 'P'))) {
+    // Check for Ctrl+Enter / Ctrl+P / Ctrl+S save trigger
+    const isSaveCombo = (e.ctrlKey || e.metaKey) && (e.key === 'Enter' || e.key === 'p' || e.key === 'P' || e.key === 's' || e.key === 'S');
+    if (isSaveCombo) {
       e.preventDefault();
       e.stopPropagation();
       if (cart.length > 0) {
         handleSaveBill(true, 'CASH');
       } else {
-        setInputError('Cart is empty. Please add items before saving.');
+        setInputError('Cart is empty. Please add items before saving (Ctrl+Enter or F10).');
         setTimeout(() => setInputError(null), 3000);
       }
       return;
@@ -650,6 +729,7 @@ export const DirectBilling: React.FC<DirectBillingProps> = ({ settings }) => {
     setCustomDiscount(0);
     setCashTendered('');
     setTableNumber('');
+    setActiveKotId(undefined);
     setInputError(null);
     setShowSuggestions(false);
     setFocusedStep('PRICE_TYPE');
@@ -658,7 +738,7 @@ export const DirectBilling: React.FC<DirectBillingProps> = ({ settings }) => {
     setTimeout(() => {
       priceTypeRef.current?.focus();
       priceTypeRef.current?.select();
-    }, 40);
+    }, 120);
   };
 
   const handleHoldBill = () => {
@@ -721,31 +801,78 @@ export const DirectBilling: React.FC<DirectBillingProps> = ({ settings }) => {
     }
 
     if (!billToPrint || !itemsToPrint || itemsToPrint.length === 0) {
-      setInputError('No recent bills found to reprint. Please generate a bill first.');
-      setTimeout(() => setInputError(null), 3000);
-      return;
+      // If no past bills exist yet, generate a sample verification receipt so user can test printer immediately
+      const sampleBill: Bill = {
+        id: `sample_${Date.now()}`,
+        billNumber: '01',
+        businessDate: getBusinessDate(settings?.businessDayStart || '04:00'),
+        orderType: 'DINE_IN',
+        priceType: 'NON_AC',
+        tableNumber: 'T-01',
+        subtotal: 115,
+        discount: 0,
+        grandTotal: 115,
+        paymentMethod: 'CASH',
+        paymentStatus: 'PAID',
+        status: 'COMPLETED',
+        reprintCount: 0,
+        userId: currentUser?.uid || 'cashier_1',
+        userName: currentUser?.name || 'Cashier',
+        createdAt: Date.now(),
+        updatedAt: Date.now()
+      };
+      const sampleItems: BillItem[] = [
+        {
+          id: `sample_item_1`,
+          billId: sampleBill.id,
+          itemId: 'item_dosa',
+          itemCode: '101',
+          itemName: 'Special Masala Dosa',
+          itemNameTamil: 'ஸ்பெஷல் மசால் தோசை',
+          quantity: 1,
+          unitPrice: 80,
+          totalPrice: 80,
+          priceType: 'NON_AC',
+          createdAt: Date.now()
+        },
+        {
+          id: `sample_item_2`,
+          billId: sampleBill.id,
+          itemId: 'item_coffee',
+          itemCode: '102',
+          itemName: 'Filter Coffee',
+          itemNameTamil: 'ஃபில்டர் காபி',
+          quantity: 1,
+          unitPrice: 35,
+          totalPrice: 35,
+          priceType: 'NON_AC',
+          createdAt: Date.now()
+        }
+      ];
+      billToPrint = sampleBill;
+      itemsToPrint = sampleItems;
+      setLastPrintedBill({ bill: sampleBill, items: sampleItems });
     }
 
     const nextCount = (billToPrint.reprintCount || 0) + 1;
     const updatedBill: Bill = { ...billToPrint, reprintCount: nextCount };
 
-    // Record audit reprint in Firestore in background
-    ReprintEngine.recordReprint(billToPrint.id, currentUser?.name || 'Cashier').catch((err) => {
-      console.warn('Reprint audit log notice:', err);
-    });
+    // Record audit reprint in Firestore in background for real bills
+    if (!billToPrint.id.startsWith('sample_')) {
+      ReprintEngine.recordReprint(billToPrint.id, currentUser?.name || 'Cashier').catch((err) => {
+        console.debug('Reprint audit log notice:', err);
+      });
+    }
 
     setSavedBill(updatedBill);
     setSavedBillItems(itemsToPrint);
     setLastPrintedBill({ bill: updatedBill, items: itemsToPrint });
     try {
-      localStorage.setItem('pos_last_printed_bill', JSON.stringify({ bill: updatedBill, items: itemsToPrint }));
+      safeStorage.setItem('pos_last_printed_bill', JSON.stringify({ bill: updatedBill, items: itemsToPrint }));
     } catch (e) {}
 
     // Trigger physical hardware print with forceHardware=true
     PrinterService.printBill(updatedBill, itemsToPrint, settings, true);
-
-    // Open on-screen modal preview
-    setIsReceiptModalOpen(true);
 
     setNotification({
       type: 'success',
@@ -868,10 +995,99 @@ export const DirectBilling: React.FC<DirectBillingProps> = ({ settings }) => {
     currentUser?.name
   ]);
 
+  // Create KOT directly from selected cart items in Billing screen
+  const handleCreateKotFromBilling = async (andPrint = true) => {
+    if (cart.length === 0) {
+      setInputError('Cart is empty. Please add items before creating KOT.');
+      setTimeout(() => setInputError(null), 3000);
+      return;
+    }
+
+    setSaving(true);
+    setInputError(null);
+
+    try {
+      const businessDate = getBusinessDate(settings?.businessDayStart || '04:00');
+      const now = Date.now();
+      const { kotNumber } = await allocateNextKotNumber(businessDate);
+      const kotId = `kot_${now}_${Math.random().toString(36).substring(2, 6)}`;
+
+      const kotItems: KotItem[] = cart.map((c, idx) => ({
+        id: `${kotId}_item_${idx + 1}`,
+        kotId,
+        itemId: c.itemId,
+        itemCode: c.itemCode,
+        itemName: c.itemName,
+        itemNameTamil: c.itemNameTamil,
+        quantity: c.quantity,
+        priceType: c.priceType || priceType,
+        unitPrice: c.unitPrice,
+        notes: c.notes || '',
+        createdAt: now,
+        updatedAt: now
+      }));
+
+      const newKot: Kot = {
+        id: kotId,
+        kotNumber,
+        businessDate,
+        orderType,
+        tableNumber: orderType === 'DINE_IN' ? (tableNumber.trim() || 'T-1') : 'Take Away',
+        waiterId: currentUser?.uid || 'staff',
+        waiterName: currentUser?.name || 'Cashier',
+        status: 'OPEN',
+        items: kotItems,
+        itemsCount: kotItems.reduce((sum, i) => sum + i.quantity, 0),
+        createdBy: currentUser?.name || 'Cashier',
+        createdAt: now,
+        updatedAt: now
+      };
+
+      // 1. Immediately persist locally (0ms latency)
+      saveKotLocally(newKot, kotItems);
+
+      // 2. Safe print slip
+      if (andPrint) {
+        try {
+          PrinterService.printKot(newKot, kotItems);
+        } catch (err) {
+          console.warn('Printer warning for KOT:', err);
+        }
+      }
+
+      // 3. Notify user
+      setNotification({
+        type: 'success',
+        message: `KOT ${kotNumber} created & sent to kitchen for ${newKot.tableNumber}!`
+      });
+
+      // 4. Background sync to Firestore
+      try {
+        const batch = writeBatch(db);
+        batch.set(doc(db, 'kots', kotId), sanitizeForFirestore(newKot));
+        kotItems.forEach((ki) => {
+          batch.set(doc(db, 'kot_items', ki.id), sanitizeForFirestore(ki));
+        });
+        batch.commit().catch((dbErr) => console.warn('Firestore KOT background write notice:', dbErr));
+      } catch (dbErr) {
+        console.warn('Firestore KOT sync notice (preserved locally):', dbErr);
+      }
+
+      // 5. Reset bill draft
+      handleNewBill();
+      setTimeout(() => setNotification(null), 4000);
+    } catch (e: any) {
+      console.error('Error creating KOT from billing:', e);
+      setInputError(e.message || 'Failed to create KOT');
+    } finally {
+      setSaving(false);
+    }
+  };
+
   const handleSaveBill = async (andPrint = true, paymentMode: 'CASH' | 'UPI' | 'CARD' = 'CASH') => {
     if (isSavingRef.current) return;
     if (cart.length === 0) {
-      setInputError('Cart is empty. Please add items before saving (Ctrl).');
+      setInputError('Cart is empty. Please add items before saving (Ctrl+Enter or F10).');
       setTimeout(() => setInputError(null), 3000);
       return;
     }
@@ -881,6 +1097,8 @@ export const DirectBilling: React.FC<DirectBillingProps> = ({ settings }) => {
     setInputError(null);
 
     try {
+      const kotIdToLink = activeKotId;
+
       // 1. Prepare bill & sequential numbering immediately
       const prepared = await BillingEngine.prepareBill({
         items: cart.map(c => ({
@@ -890,6 +1108,7 @@ export const DirectBilling: React.FC<DirectBillingProps> = ({ settings }) => {
         orderType,
         priceType,
         tableNumber: orderType === 'DINE_IN' ? tableNumber : undefined,
+        kotId: kotIdToLink,
         discount: effectiveDiscount,
         userId: currentUser?.uid || 'cashier_1',
         userName: currentUser?.name || 'Cashier',
@@ -904,9 +1123,14 @@ export const DirectBilling: React.FC<DirectBillingProps> = ({ settings }) => {
       setSavedBillItems(prepared.items);
       setLastPrintedBill({ bill: prepared.bill, items: prepared.items });
 
+      // If linked to KOT, immediately free the table in local store
+      if (kotIdToLink) {
+        updateLocalKotStatus(kotIdToLink, 'BILLED');
+      }
+
       // Cache in localStorage for instant reprint even across tab reload
       try {
-        localStorage.setItem('pos_last_printed_bill', JSON.stringify({
+        safeStorage.setItem('pos_last_printed_bill', JSON.stringify({
           bill: prepared.bill,
           items: prepared.items
         }));
@@ -934,7 +1158,7 @@ export const DirectBilling: React.FC<DirectBillingProps> = ({ settings }) => {
       BillingEngine.persistBillAsync(
         prepared.bill, 
         prepared.items, 
-        undefined, 
+        kotIdToLink, 
         currentUser?.uid || 'cashier_1'
       ).catch((persistErr) => {
         console.warn('Background Firestore persist notice (queued in offline cache):', persistErr);
@@ -952,7 +1176,14 @@ export const DirectBilling: React.FC<DirectBillingProps> = ({ settings }) => {
   const toggleRushMode = () => {
     const next = !fastRushMode;
     setFastRushMode(next);
-    localStorage.setItem('pos_fast_rush_mode', String(next));
+    safeStorage.setItem('pos_fast_rush_mode', String(next));
+    setNotification({
+      type: 'info',
+      message: next 
+        ? '⚡ Fast Billing Mode: On-screen preview skipped for high-speed checkout!' 
+        : 'Standard Mode: On-screen receipt preview modal enabled.'
+    });
+    setTimeout(() => setNotification(null), 3500);
   };
 
   const toggleMockPrintMode = () => {
@@ -969,40 +1200,47 @@ export const DirectBilling: React.FC<DirectBillingProps> = ({ settings }) => {
   };
 
   return (
-    <div className="flex flex-col min-h-full lg:h-full bg-slate-100/90 text-slate-800 p-2 sm:p-3.5 gap-2.5 overflow-y-auto lg:overflow-hidden font-sans">
+    <div className="flex flex-col min-h-full lg:h-full bg-slate-100/90 text-slate-800 p-2 sm:p-3.5 gap-2 sm:gap-2.5 overflow-y-auto lg:overflow-hidden font-sans pb-16 md:pb-3">
       
       {/* Top Header Bar */}
-      <div className="flex flex-wrap items-center justify-between bg-white border border-slate-200 rounded-xl px-3 sm:px-4 py-2 sm:py-2.5 gap-2 text-xs shadow-2xs shrink-0">
+      <div className="flex items-center justify-between bg-white border border-slate-200 rounded-xl px-2.5 sm:px-4 py-2 sm:py-2.5 gap-2 text-xs shadow-2xs shrink-0 w-full">
         
-        {/* Left: App Title */}
-        <div className="flex items-center gap-2 sm:gap-2.5">
-          <div className="w-8 h-8 rounded-lg bg-amber-500 flex items-center justify-center text-white shadow-2xs">
-            <Zap className="w-4 h-4 text-white stroke-[2.5]" />
+        {/* Left: App Title & Shop Logo */}
+        <div className="flex items-center gap-2.5 min-w-0">
+          <div className="w-8 h-8 rounded-full bg-white border border-amber-400 shadow-2xs flex items-center justify-center p-0.5 shrink-0 overflow-hidden">
+            <img 
+              src={settings?.logoUrl || DEFAULT_RESTAURANT_LOGO} 
+              alt={settings?.restaurantName || 'SRI SARAVANA BHAVAN'} 
+              className="w-full h-full object-contain"
+              referrerPolicy="no-referrer"
+              onError={(e) => {
+                e.currentTarget.onerror = null;
+                e.currentTarget.src = SRI_SARAVANA_BHAVAN_SVG;
+              }}
+            />
           </div>
-          <div>
-            <div className="flex items-center gap-2">
-              <span className="font-black text-xs sm:text-sm tracking-tight text-slate-900 uppercase leading-none block">Direct Billing</span>
+          <div className="flex items-center gap-1.5 sm:gap-2 min-w-0">
+            <span className="font-black text-xs sm:text-sm tracking-tight text-slate-900 uppercase leading-none truncate">Direct Billing</span>
               {autoSaveStatus === 'saving' && (
-                <span className="flex items-center gap-1 text-[10px] font-bold text-blue-700 bg-blue-50 border border-blue-200 px-2 py-0.5 rounded-full animate-pulse">
+                <span className="hidden xs:flex items-center gap-1 text-[10px] font-bold text-blue-700 bg-blue-50 border border-blue-200 px-1.5 py-0.5 rounded-full animate-pulse">
                   <RefreshCw className="w-2.5 h-2.5 animate-spin text-blue-600" />
-                  <span>Auto-saving draft...</span>
+                  <span className="hidden sm:inline">Auto-saving draft...</span>
                 </span>
               )}
               {autoSaveStatus === 'saved' && cart.length > 0 && (
-                <span className="flex items-center gap-1 text-[10px] font-bold text-emerald-700 bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded-full" title="Current bill-in-progress is auto-saved to Firestore">
-                  <Cloud className="w-3 h-3 text-emerald-600" />
-                  <span>Cloud auto-saved</span>
+                <span className="hidden xs:flex items-center gap-1 text-[10px] font-bold text-emerald-700 bg-emerald-50 border border-emerald-200 px-1.5 py-0.5 rounded-full" title="Current bill-in-progress is auto-saved to Firestore">
+                  <Cloud className="w-2.5 h-2.5 sm:w-3 sm:h-3 text-emerald-600" />
+                  <span className="hidden sm:inline">Cloud saved</span>
                 </span>
               )}
             </div>
           </div>
-        </div>
 
         {/* Right: Quick Actions */}
-        <div className="flex items-center gap-1.5 sm:gap-2">
+        <div className="flex items-center gap-1 sm:gap-2 shrink-0">
           {heldBills.length > 0 && (
             <div className="flex items-center gap-1">
-              <span className="text-[11px] font-bold text-amber-800 bg-amber-50 border border-amber-200 px-2 py-1 rounded-lg">
+              <span className="text-[10px] sm:text-[11px] font-bold text-amber-800 bg-amber-50 border border-amber-200 px-1.5 sm:px-2 py-1 rounded-lg">
                 Held: {heldBills.length}
               </span>
             </div>
@@ -1011,25 +1249,27 @@ export const DirectBilling: React.FC<DirectBillingProps> = ({ settings }) => {
           <button
             type="button"
             onClick={handleReprintLastBill}
-            className="px-2.5 sm:px-3 py-1.5 rounded-lg text-xs font-bold bg-amber-50 hover:bg-amber-100 text-amber-900 border border-amber-300 flex items-center gap-1.5 transition-colors cursor-pointer shadow-2xs"
+            className="px-2 sm:px-3 py-1.5 rounded-lg text-[11px] sm:text-xs font-bold bg-amber-50 hover:bg-amber-100 text-amber-900 border border-amber-300 flex items-center gap-1 sm:gap-1.5 transition-colors cursor-pointer shadow-2xs shrink-0"
             title="Reprint last customer receipt (Shortcut: F7 or Alt+R)"
           >
-            <RotateCcw className="w-3.5 h-3.5 text-amber-700" />
-            <span>
+            <RotateCcw className="w-3 h-3 sm:w-3.5 sm:h-3.5 text-amber-700" />
+            <span className="hidden sm:inline">
               {lastPrintedBill 
                 ? `Reprint #${lastPrintedBill.bill.billNumber} (₹${lastPrintedBill.bill.grandTotal})` 
-                : 'Reprint Last Bill [F7]'}
+                : 'Reprint [F7]'}
             </span>
+            <span className="sm:hidden">Reprint</span>
           </button>
 
           <button
             type="button"
             onClick={handleNewBill}
-            className="px-2.5 sm:px-3 py-1.5 rounded-lg text-xs font-bold bg-slate-50 hover:bg-slate-100 text-slate-700 border border-slate-200 flex items-center gap-1.5 transition-colors cursor-pointer"
+            className="px-2 sm:px-3 py-1.5 rounded-lg text-[11px] sm:text-xs font-bold bg-slate-50 hover:bg-slate-100 text-slate-700 border border-slate-200 flex items-center gap-1 sm:gap-1.5 transition-colors cursor-pointer shrink-0"
             title="Start new customer bill"
           >
-            <Plus className="w-3.5 h-3.5 text-slate-500" />
-            <span>New Bill</span>
+            <Plus className="w-3 h-3 sm:w-3.5 sm:h-3.5 text-slate-500" />
+            <span className="hidden xs:inline">New Bill</span>
+            <span className="xs:hidden">New</span>
           </button>
         </div>
       </div>
@@ -1043,6 +1283,18 @@ export const DirectBilling: React.FC<DirectBillingProps> = ({ settings }) => {
           </div>
           {lastPrintedBill && (
             <div className="flex items-center gap-1.5">
+              <button
+                type="button"
+                onClick={() => {
+                  setSavedBill(lastPrintedBill.bill);
+                  setSavedBillItems(lastPrintedBill.items);
+                  setIsReceiptModalOpen(true);
+                }}
+                className="px-2.5 py-1 rounded bg-slate-200 hover:bg-slate-300 text-slate-800 text-[11px] font-bold cursor-pointer"
+                title="View on-screen receipt preview"
+              >
+                View
+              </button>
               <button
                 type="button"
                 onClick={handleReprintLastBill}
@@ -1083,22 +1335,27 @@ export const DirectBilling: React.FC<DirectBillingProps> = ({ settings }) => {
       <div className="flex flex-col gap-2.5 flex-1 min-h-0 lg:overflow-hidden">
         
         {/* TOP SECTION: DIRECT BILLING CONTROLS */}
-        <div className="bg-white border border-slate-200 rounded-xl p-3 shadow-2xs space-y-3 shrink-0">
+        <div className="bg-white border border-slate-200 rounded-xl p-3 shadow-2xs shrink-0">
           
-          {/* Full-Width Flexbox Billing Input Controls */}
-          <div className="flex flex-col md:flex-row flex-wrap xl:flex-nowrap items-stretch md:items-end gap-2.5 w-full">
+          {/* Full-Width Responsive Billing Input Controls with Perfect Line Alignment */}
+          <div className="flex flex-wrap items-start gap-2 md:gap-2.5 w-full">
             
             {/* 1. Price Mode */}
-            <div className="w-full sm:w-auto md:w-44 lg:w-48 shrink-0">
-              <label className="text-[11px] font-bold text-slate-700 block mb-1.5">
-                Price Mode
-              </label>
-              <div className="h-10 flex items-center bg-slate-100 p-1 rounded-lg border border-slate-200 gap-1 w-full">
+            <div className="order-1 w-[calc(50%-4px)] sm:w-[150px] shrink-0">
+              <div className="h-5 mb-1.5 flex items-center">
+                <label className="text-[10px] sm:text-[11px] font-bold text-slate-700 truncate">
+                  Price Mode
+                </label>
+              </div>
+              <div 
+                style={{ height: '30px', width: '150px' }} 
+                className="flex items-center bg-slate-100 p-0.5 rounded-lg border border-slate-200 gap-1 w-[150px] max-w-full"
+              >
                 <input
                   ref={priceTypeRef}
                   type="text"
                   maxLength={1}
-                  value={priceTypeChoice}
+                  value={priceTypeChoice || '1'}
                   onChange={(e) => {
                     const val = e.target.value;
                     if (val === '1' || val === '2') {
@@ -1111,11 +1368,12 @@ export const DirectBilling: React.FC<DirectBillingProps> = ({ settings }) => {
                     priceTypeRef.current?.select();
                   }}
                   onKeyDown={handlePriceTypeKeyDown}
-                  className="w-7 h-8 bg-white border border-slate-300 rounded text-center font-mono font-bold text-xs text-slate-900 focus:outline-none focus:ring-2 focus:ring-amber-500 shrink-0"
+                  className="w-6 sm:w-7 h-[25px] bg-white border border-slate-300 rounded text-center font-mono font-bold text-xs text-slate-900 focus:outline-none focus:ring-2 focus:ring-amber-500 shrink-0"
                   autoComplete="off"
                 />
                 <button
                   type="button"
+                  style={{ height: '25px' }}
                   onClick={() => {
                     setPriceTypeChoice('1');
                     setPriceType('NON_AC');
@@ -1123,7 +1381,7 @@ export const DirectBilling: React.FC<DirectBillingProps> = ({ settings }) => {
                     orderTypeRef.current?.focus();
                     orderTypeRef.current?.select();
                   }}
-                  className={`flex-1 h-8 rounded text-xs font-bold transition-all cursor-pointer flex items-center justify-center ${
+                  className={`flex-1 h-[25px] rounded text-[11px] font-bold transition-all cursor-pointer flex items-center justify-center ${
                     priceType === 'NON_AC'
                       ? 'bg-white text-amber-700 shadow-2xs border border-slate-200'
                       : 'text-slate-600 hover:text-slate-900'
@@ -1133,6 +1391,7 @@ export const DirectBilling: React.FC<DirectBillingProps> = ({ settings }) => {
                 </button>
                 <button
                   type="button"
+                  style={{ height: '25px' }}
                   onClick={() => {
                     setPriceTypeChoice('2');
                     setPriceType('AC');
@@ -1140,7 +1399,7 @@ export const DirectBilling: React.FC<DirectBillingProps> = ({ settings }) => {
                     orderTypeRef.current?.focus();
                     orderTypeRef.current?.select();
                   }}
-                  className={`flex-1 h-8 rounded text-xs font-bold transition-all cursor-pointer flex items-center justify-center ${
+                  className={`flex-1 h-[25px] rounded text-[11px] font-bold transition-all cursor-pointer flex items-center justify-center ${
                     priceType === 'AC'
                       ? 'bg-white text-amber-700 shadow-2xs border border-slate-200'
                       : 'text-slate-600 hover:text-slate-900'
@@ -1152,16 +1411,21 @@ export const DirectBilling: React.FC<DirectBillingProps> = ({ settings }) => {
             </div>
 
             {/* 2. Order Type */}
-            <div className="w-full sm:w-auto md:w-56 lg:w-60 shrink-0">
-              <label className="text-[11px] font-bold text-slate-700 block mb-1.5">
-                Order Type
-              </label>
-              <div className="h-10 flex items-center bg-slate-100 p-1 rounded-lg border border-slate-200 gap-1 w-full">
+            <div className="order-2 w-[calc(50%-4px)] sm:w-[150px] shrink-0">
+              <div className="h-5 mb-1.5 flex items-center">
+                <label className="text-[10px] sm:text-[11px] font-bold text-slate-700 truncate">
+                  Order Type
+                </label>
+              </div>
+              <div 
+                style={{ height: '30px', borderColor: '#120def', width: '150px' }} 
+                className="flex items-center bg-slate-100 p-0.5 rounded-lg border gap-1 w-[150px] max-w-full"
+              >
                 <input
                   ref={orderTypeRef}
                   type="text"
                   maxLength={1}
-                  value={orderTypeChoice}
+                  value={orderTypeChoice || '1'}
                   onChange={(e) => {
                     const val = e.target.value;
                     if (val === '1' || val === '2') {
@@ -1174,48 +1438,33 @@ export const DirectBilling: React.FC<DirectBillingProps> = ({ settings }) => {
                     orderTypeRef.current?.select();
                   }}
                   onKeyDown={handleOrderTypeKeyDown}
-                  className="w-7 h-8 bg-white border border-slate-300 rounded text-center font-mono font-bold text-xs text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-500 shrink-0"
+                  className="w-6 sm:w-7 h-[25px] bg-white border border-slate-300 rounded text-center font-mono font-bold text-xs text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-500 shrink-0"
                   autoComplete="off"
                 />
                 <button
                   type="button"
-                  onClick={() => {
-                    setOrderTypeChoice('1');
-                    setOrderType('DINE_IN');
-                    setFocusedStep('ITEM_CODE');
-                    itemCodeRef.current?.focus();
-                  }}
-                  className={`flex-1 h-8 rounded text-xs font-bold transition-all cursor-pointer flex items-center justify-center gap-1 ${
-                    orderType === 'DINE_IN'
-                      ? 'bg-white text-blue-700 shadow-2xs border border-slate-200'
-                      : 'text-slate-600 hover:text-slate-900'
-                  }`}
-                >
-                  <Utensils className="w-3 h-3" /> Dine In
-                </button>
-                <button
-                  type="button"
+                  style={{ height: '25px' }}
                   onClick={() => {
                     setOrderTypeChoice('2');
                     setOrderType('TAKE_AWAY');
                     setFocusedStep('ITEM_CODE');
                     itemCodeRef.current?.focus();
                   }}
-                  className={`flex-1 h-8 rounded text-xs font-bold transition-all cursor-pointer flex items-center justify-center gap-1 ${
+                  className={`flex-1 h-[25px] rounded text-[11px] font-bold transition-all cursor-pointer flex items-center justify-center gap-0.5 ${
                     orderType === 'TAKE_AWAY'
                       ? 'bg-white text-blue-700 shadow-2xs border border-slate-200'
                       : 'text-slate-600 hover:text-slate-900'
                   }`}
                 >
-                  <Receipt className="w-3 h-3" /> Take Away
+                  <Receipt className="w-3 h-3 hidden xs:inline" /> Parcel
                 </button>
               </div>
             </div>
 
             {/* 3. Item Code Input */}
-            <div className="w-full sm:w-auto md:w-44 lg:w-48 shrink-0 relative">
-              <div className="flex justify-between items-center mb-1.5">
-                <label className="text-[11px] font-bold text-slate-700">
+            <div className="order-3 w-[calc(55%-4px)] sm:w-[150px] shrink-0 relative">
+              <div className="h-5 mb-1.5 flex items-center justify-between">
+                <label className="text-[10px] sm:text-[11px] font-bold text-slate-700">
                   Item Code
                 </label>
                 <button
@@ -1228,11 +1477,12 @@ export const DirectBilling: React.FC<DirectBillingProps> = ({ settings }) => {
                 </button>
               </div>
 
-              <div className="relative h-10 w-full">
+              <div className="relative h-[31px] w-[150px] max-w-full">
                 <input
                   ref={itemCodeRef}
                   type="text"
-                  value={itemCodeInput}
+                  style={{ height: '31px', width: '150px' }}
+                  value={itemCodeInput || ''}
                   onChange={(e) => {
                     setItemCodeInput(e.target.value);
                     setShowSuggestions(true);
@@ -1244,7 +1494,7 @@ export const DirectBilling: React.FC<DirectBillingProps> = ({ settings }) => {
                   }}
                   onKeyDown={handleItemCodeKeyDown}
                   placeholder="Code (e.g. 101)"
-                  className={`w-full h-10 bg-slate-50 border rounded-lg px-3 text-sm font-mono font-bold text-slate-900 placeholder-slate-400 focus:outline-none focus:bg-white focus:border-amber-500 focus:ring-2 focus:ring-amber-500/20 transition-all text-center tracking-wider ${
+                  className={`w-[150px] max-w-full h-[31px] bg-slate-50 border rounded-lg px-2 text-xs font-mono font-bold text-slate-900 placeholder-slate-400 focus:outline-none focus:bg-white focus:border-amber-500 focus:ring-2 focus:ring-amber-500/20 transition-all text-center tracking-wider ${
                     focusedStep === 'ITEM_CODE' ? 'border-amber-500 ring-2 ring-amber-400/20' : 'border-slate-300'
                   }`}
                   autoComplete="off"
@@ -1260,7 +1510,7 @@ export const DirectBilling: React.FC<DirectBillingProps> = ({ settings }) => {
                       itemCodeRef.current?.focus();
                       setFocusedStep('ITEM_CODE');
                     }}
-                    className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-700 p-0.5 text-xs cursor-pointer"
+                    className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-700 p-0.5 text-xs cursor-pointer"
                   >
                     ✕
                   </button>
@@ -1307,10 +1557,50 @@ export const DirectBilling: React.FC<DirectBillingProps> = ({ settings }) => {
               )}
             </div>
 
-            {/* 4. Selected Item & Rate Display (Full-width expansion via flex-1) */}
-            <div className="flex-1 min-w-[220px]">
-              <div className="flex justify-between items-center mb-1.5">
-                <label className="text-[11px] font-bold text-slate-700">
+            {/* 4. Quantity & Add Button */}
+            <div className="order-4 w-[calc(45%-4px)] sm:w-auto md:order-5 shrink-0">
+              <div className="h-5 mb-1.5 flex items-center">
+                <label className="text-[10px] sm:text-[11px] font-bold text-slate-700">
+                  Quantity
+                </label>
+              </div>
+              <div className="flex items-center gap-1.5">
+                <input
+                  ref={quantityRef}
+                  type="number"
+                  min="1"
+                  style={{ height: '35px' }}
+                  value={quantityInput || ''}
+                  onChange={(e) => setQuantityInput(e.target.value)}
+                  onFocus={() => setFocusedStep('QUANTITY')}
+                  onKeyDown={handleQuantityKeyDown}
+                  disabled={!selectedMenuItem}
+                  placeholder="1"
+                  className={`w-12 sm:w-14 h-[35px] bg-white border rounded-lg text-center font-mono font-bold text-xs sm:text-sm text-slate-900 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-emerald-500/20 disabled:opacity-40 disabled:border-slate-200 ${
+                    focusedStep === 'QUANTITY' ? 'border-emerald-600 ring-2 ring-emerald-500/20' : 'border-slate-300'
+                  }`}
+                />
+                <button
+                  type="button"
+                  disabled={!selectedMenuItem}
+                  style={{ height: '35px', width: '100px' }}
+                  onClick={() => {
+                    const evt = { key: 'Enter', preventDefault: () => {} } as any;
+                    handleQuantityKeyDown(evt);
+                  }}
+                  className="w-[100px] h-[35px] bg-emerald-600 hover:bg-emerald-500 disabled:bg-slate-200 disabled:text-slate-400 text-white font-bold rounded-lg text-xs flex items-center justify-center gap-1 cursor-pointer transition-colors shadow-2xs"
+                  title="Add item to bill"
+                >
+                  <Plus className="w-3.5 h-3.5 stroke-[2.5]" />
+                  <span>Add</span>
+                </button>
+              </div>
+            </div>
+
+            {/* 5. Selected Item & Rate Display */}
+            <div className="order-5 w-full md:order-4 md:flex-1 md:min-w-[200px] lg:w-[402.4px] lg:flex-none">
+              <div className="h-5 mb-1.5 flex items-center justify-between">
+                <label className="text-[10px] sm:text-[11px] font-bold text-slate-700">
                   Selected Item
                 </label>
                 {selectedMenuItem && (
@@ -1320,71 +1610,38 @@ export const DirectBilling: React.FC<DirectBillingProps> = ({ settings }) => {
                 )}
               </div>
               
-              <div className={`h-10 rounded-lg px-3 border transition-all flex items-center justify-between gap-2 w-full ${
-                selectedMenuItem 
-                  ? 'bg-emerald-50/90 border-emerald-300 shadow-2xs' 
-                  : 'bg-slate-50 border-slate-200 text-slate-400'
-              }`}>
+              <div 
+                style={{ height: '35px', width: '100%', maxWidth: '402.4px' }} 
+                className={`h-[35px] rounded-lg px-2.5 border transition-all flex items-center justify-between gap-2 ${
+                  selectedMenuItem 
+                    ? 'bg-emerald-50/90 border-emerald-300 shadow-2xs' 
+                    : 'bg-slate-50 border-slate-200 text-slate-400'
+                }`}
+              >
                 {selectedMenuItem ? (
                   <>
                     <div className="min-w-0 flex-1 flex items-center gap-1.5">
-                      <span className="text-sm font-bold text-slate-900 truncate">
+                      <span className="text-xs sm:text-sm font-bold text-slate-900 truncate">
                         {selectedMenuItem.itemName}
                       </span>
                       {selectedMenuItem.itemNameTamil && (
-                        <span className="text-[11px] text-emerald-800 truncate hidden sm:inline">
+                        <span className="text-[10px] sm:text-[11px] text-emerald-800 truncate hidden xs:inline">
                           ({selectedMenuItem.itemNameTamil})
                         </span>
                       )}
                     </div>
                     <div className="text-right shrink-0 font-mono pl-2 border-l border-emerald-200 flex items-center gap-1">
-                      <span className="text-base font-black text-emerald-800">
+                      <span className="text-sm sm:text-base font-black text-emerald-800">
                         ₹{currentItemPrice}
                       </span>
                     </div>
                   </>
                 ) : (
-                  <div className="text-xs text-slate-400 flex items-center gap-2">
+                  <div className="text-xs text-slate-400 flex items-center gap-1.5">
                     <Utensils className="w-3.5 h-3.5 text-slate-300" />
-                    <span>Enter code to select item</span>
+                    <span className="text-[11px] sm:text-xs">Type code to select dish</span>
                   </div>
                 )}
-              </div>
-            </div>
-
-            {/* 5. Quantity & Add Button */}
-            <div className="w-full sm:w-auto md:w-44 lg:w-48 shrink-0">
-              <label className="text-[11px] font-bold text-slate-700 block mb-1.5">
-                Quantity
-              </label>
-              <div className="h-10 flex items-center gap-1.5 w-full">
-                <input
-                  ref={quantityRef}
-                  type="number"
-                  min="1"
-                  value={quantityInput}
-                  onChange={(e) => setQuantityInput(e.target.value)}
-                  onFocus={() => setFocusedStep('QUANTITY')}
-                  onKeyDown={handleQuantityKeyDown}
-                  disabled={!selectedMenuItem}
-                  placeholder="1"
-                  className={`w-14 h-10 bg-white border rounded-lg text-center font-mono font-bold text-sm text-slate-900 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-emerald-500/20 disabled:opacity-40 disabled:border-slate-200 ${
-                    focusedStep === 'QUANTITY' ? 'border-emerald-600 ring-2 ring-emerald-500/20' : 'border-slate-300'
-                  }`}
-                />
-                <button
-                  type="button"
-                  disabled={!selectedMenuItem}
-                  onClick={() => {
-                    const evt = { key: 'Enter', preventDefault: () => {} } as any;
-                    handleQuantityKeyDown(evt);
-                  }}
-                  className="flex-1 h-10 bg-emerald-600 hover:bg-emerald-500 disabled:bg-slate-200 disabled:text-slate-400 text-white font-bold rounded-lg text-xs flex items-center justify-center gap-1 cursor-pointer transition-colors shadow-2xs"
-                  title="Add item to bill"
-                >
-                  <Plus className="w-4 h-4 stroke-[2.5]" />
-                  <span>Add</span>
-                </button>
               </div>
             </div>
 
@@ -1396,7 +1653,7 @@ export const DirectBilling: React.FC<DirectBillingProps> = ({ settings }) => {
         <div className="flex-1 min-h-0 flex flex-col bg-white border border-slate-200 rounded-xl overflow-hidden shadow-2xs">
           
           {/* Cart Header */}
-          <div className="px-4 py-2.5 bg-slate-50 border-b border-slate-200 flex items-center justify-between shrink-0">
+          <div style={{ height: '40.8px' }} className="px-4 py-2 bg-slate-50 border-b border-slate-200 flex items-center justify-between shrink-0">
             <div className="flex items-center gap-2.5">
               <div className="w-6 h-6 rounded-md bg-amber-100 border border-amber-200 flex items-center justify-center">
                 <Receipt className="w-3.5 h-3.5 text-amber-700" />
@@ -1404,6 +1661,9 @@ export const DirectBilling: React.FC<DirectBillingProps> = ({ settings }) => {
               <span className="font-bold text-sm text-slate-900">Customer Bill</span>
               <span className="text-xs text-slate-500 font-mono">
                 ({orderType === 'DINE_IN' ? 'Dine In' : 'Take Away'} • {priceType})
+              </span>
+              <span className="hidden md:inline text-[11px] text-slate-400 font-normal">
+                • Swipe left to remove
               </span>
             </div>
 
@@ -1440,77 +1700,109 @@ export const DirectBilling: React.FC<DirectBillingProps> = ({ settings }) => {
               </div>
             ) : (
               <>
-                {/* Mobile View: Compact Cards */}
+                {/* Mobile View: Compact Cards with Swipe-to-Delete */}
                 <div className="sm:hidden space-y-2 font-sans">
-                  {cart.map((item, idx) => (
-                    <div 
-                      key={idx} 
-                      className="bg-slate-50 border border-slate-200 rounded-xl p-2.5 flex flex-col gap-2 shadow-2xs"
-                    >
-                      <div className="flex items-start justify-between gap-2">
-                        <div className="min-w-0 flex-1">
-                          <div className="flex items-center gap-1.5 flex-wrap">
-                            <span className="font-mono font-bold text-amber-700 text-xs bg-white px-1.5 py-0.5 rounded border border-slate-200">
-                              #{item.itemCode}
-                            </span>
-                            <span className="font-bold text-slate-900 text-xs sm:text-sm">
-                              {item.itemName}
-                            </span>
-                          </div>
-                          {item.notes && (
-                            <span className="text-[10px] text-amber-700 font-medium mt-0.5 block">
-                              ⚡ {item.notes}
-                            </span>
-                          )}
+                  <AnimatePresence initial={false}>
+                    {cart.map((item, idx) => (
+                      <motion.div 
+                        key={`${item.itemId}_${item.priceType}`} 
+                        layout
+                        initial={{ opacity: 0, y: -8, scale: 0.98 }}
+                        animate={{ opacity: 1, y: 0, scale: 1 }}
+                        exit={{ opacity: 0, height: 0, marginBottom: 0, scale: 0.9, transition: { duration: 0.18 } }}
+                        transition={{ duration: 0.22, ease: [0.16, 1, 0.3, 1] }}
+                        className="relative overflow-hidden rounded-xl bg-red-600 select-none shadow-2xs"
+                      >
+                        {/* Swipe Reveal Action Layer */}
+                        <div className="absolute inset-0 flex items-center justify-end px-4 text-white font-bold text-xs gap-1.5 pointer-events-none">
+                          <Trash2 className="w-4 h-4 text-white animate-pulse" />
+                          <span>Release to delete</span>
                         </div>
-                        <button
-                          onClick={() => handleRemoveFromCart(idx)}
-                          className="p-1 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded transition-colors cursor-pointer shrink-0"
-                          title="Remove item"
+
+                        {/* Draggable Item Surface */}
+                        <motion.div
+                          drag="x"
+                          dragDirectionLock
+                          dragConstraints={{ left: -140, right: 0 }}
+                          dragElastic={{ left: 0.5, right: 0.05 }}
+                          onDragEnd={(_, info) => {
+                            if (info.offset.x < -70 || info.velocity.x < -350) {
+                              handleRemoveFromCart(idx);
+                            }
+                          }}
+                          className="bg-slate-50 border border-slate-200 rounded-xl p-2.5 flex flex-col gap-2 relative z-10 cursor-grab active:cursor-grabbing touch-pan-y"
                         >
-                          <Trash2 className="w-4 h-4" />
-                        </button>
-                      </div>
-
-                      <div className="flex items-center justify-between gap-2 pt-1 border-t border-slate-200/80">
-                        <div className="flex items-center gap-2">
-                          <div className="inline-flex items-center gap-2 bg-white px-2 py-1 rounded-lg border border-slate-200 shadow-2xs font-mono">
+                          <div className="flex items-start justify-between gap-2">
+                            <div className="min-w-0 flex-1">
+                              <div className="flex items-center gap-1.5 flex-wrap">
+                                <span className="font-mono font-bold text-amber-700 text-xs bg-white px-1.5 py-0.5 rounded border border-slate-200">
+                                  #{item.itemCode}
+                                </span>
+                                <span className="font-bold text-slate-900 text-xs sm:text-sm">
+                                  {item.itemName}
+                                </span>
+                              </div>
+                              {item.notes && (
+                                <span className="text-[10px] text-amber-700 font-medium mt-0.5 block">
+                                  ⚡ {item.notes}
+                                </span>
+                              )}
+                            </div>
                             <button
-                              onClick={() => handleUpdateCartQty(idx, item.quantity - 1)}
-                              className="text-slate-600 hover:text-amber-700 font-bold px-1.5 py-0.5 rounded hover:bg-slate-100 transition-colors cursor-pointer text-sm"
+                              onPointerDown={(e) => e.stopPropagation()}
+                              onClick={() => handleRemoveFromCart(idx)}
+                              className="p-1 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded transition-colors cursor-pointer shrink-0"
+                              title="Remove item"
                             >
-                              -
-                            </button>
-                            <span className="font-bold text-slate-900 text-sm min-w-[20px] text-center">{item.quantity}</span>
-                            <button
-                              onClick={() => handleUpdateCartQty(idx, item.quantity + 1)}
-                              className="text-slate-600 hover:text-amber-700 font-bold px-1.5 py-0.5 rounded hover:bg-slate-100 transition-colors cursor-pointer text-sm"
-                            >
-                              +
+                              <Trash2 className="w-4 h-4" />
                             </button>
                           </div>
 
-                          <button
-                            type="button"
-                            onClick={() => setActiveItemNoteIdx(idx)}
-                            className="text-[10px] text-slate-600 hover:text-amber-800 font-mono flex items-center gap-0.5 cursor-pointer bg-white hover:bg-amber-50 px-2 py-1 rounded-lg border border-slate-200"
-                            title="Add Cooking Note"
-                          >
-                            <SlidersHorizontal className="w-3 h-3 text-amber-600" />
-                            <span>{item.notes ? 'Note' : '+ Note'}</span>
-                          </button>
-                        </div>
+                          <div className="flex items-center justify-between gap-2 pt-1 border-t border-slate-200/80">
+                            <div className="flex items-center gap-2">
+                              <div 
+                                className="inline-flex items-center gap-2 bg-white px-2 py-1 rounded-lg border border-slate-200 shadow-2xs font-mono"
+                                onPointerDown={(e) => e.stopPropagation()}
+                              >
+                                <button
+                                  onClick={() => handleUpdateCartQty(idx, item.quantity - 1)}
+                                  className="text-slate-600 hover:text-amber-700 font-bold px-1.5 py-0.5 rounded hover:bg-slate-100 transition-colors cursor-pointer text-sm"
+                                >
+                                  -
+                                </button>
+                                <span className="font-bold text-slate-900 text-sm min-w-[20px] text-center">{item.quantity}</span>
+                                <button
+                                  onClick={() => handleUpdateCartQty(idx, item.quantity + 1)}
+                                  className="text-slate-600 hover:text-amber-700 font-bold px-1.5 py-0.5 rounded hover:bg-slate-100 transition-colors cursor-pointer text-sm"
+                                >
+                                  +
+                                </button>
+                              </div>
 
-                        <div className="text-right font-mono">
-                          <span className="text-[11px] text-slate-500 block">₹{item.unitPrice} each</span>
-                          <span className="text-sm font-black text-slate-900">₹{item.totalPrice}</span>
-                        </div>
-                      </div>
-                    </div>
-                  ))}
+                              <button
+                                type="button"
+                                onPointerDown={(e) => e.stopPropagation()}
+                                onClick={() => setActiveItemNoteIdx(idx)}
+                                className="text-[10px] text-slate-600 hover:text-amber-800 font-mono flex items-center gap-0.5 cursor-pointer bg-white hover:bg-amber-50 px-2 py-1 rounded-lg border border-slate-200"
+                                title="Add Cooking Note"
+                              >
+                                <SlidersHorizontal className="w-3 h-3 text-amber-600" />
+                                <span>{item.notes ? 'Note' : '+ Note'}</span>
+                              </button>
+                            </div>
+
+                            <div className="text-right font-mono">
+                              <span className="text-[11px] text-slate-500 block">₹{item.unitPrice} each</span>
+                              <span className="text-sm font-black text-slate-900">₹{item.totalPrice}</span>
+                            </div>
+                          </div>
+                        </motion.div>
+                      </motion.div>
+                    ))}
+                  </AnimatePresence>
                 </div>
 
-                {/* Desktop View: Clean Table */}
+                {/* Desktop View: Clean Table with Swipe-to-Delete Support */}
                 <table className="w-full text-sm text-left hidden sm:table">
                   <thead>
                     <tr className="border-b border-slate-200 text-slate-500 uppercase text-xs tracking-wider bg-slate-50/50">
@@ -1520,58 +1812,83 @@ export const DirectBilling: React.FC<DirectBillingProps> = ({ settings }) => {
                       <th className="py-2.5 text-center w-36">Quantity</th>
                       <th className="py-2.5 text-right w-24">Rate</th>
                       <th className="py-2.5 text-right w-28">Total</th>
-                      <th className="py-2.5 text-center w-14">Action</th>
+                      <th className="py-2.5 text-center w-14" title="Swipe row left to remove">Action</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100 font-mono">
-                    {cart.map((item, idx) => (
-                      <tr key={idx} className="hover:bg-slate-50/80 transition-colors">
-                        <td className="py-2.5 pl-3 text-slate-400 text-xs">{idx + 1}</td>
-                        <td className="py-2.5 font-bold text-amber-700 text-sm">#{item.itemCode}</td>
-                        <td className="py-2.5 font-sans">
-                          <div className="font-bold text-slate-900 text-sm flex items-center gap-2">
-                            <span>{item.itemName}</span>
-                            <button
-                              type="button"
-                              onClick={() => setActiveItemNoteIdx(idx)}
-                              className="text-[10px] text-slate-500 hover:text-amber-800 font-mono flex items-center gap-0.5 cursor-pointer bg-slate-100 hover:bg-amber-50 px-1.5 py-0.5 rounded border border-slate-200"
-                              title="Add Cooking Note"
+                    <AnimatePresence initial={false}>
+                      {cart.map((item, idx) => (
+                        <motion.tr 
+                          key={`${item.itemId}_${item.priceType}`} 
+                          layout
+                          drag="x"
+                          dragDirectionLock
+                          dragConstraints={{ left: -140, right: 0 }}
+                          dragElastic={{ left: 0.5, right: 0.05 }}
+                          onDragEnd={(_, info) => {
+                            if (info.offset.x < -70 || info.velocity.x < -350) {
+                              handleRemoveFromCart(idx);
+                            }
+                          }}
+                          initial={{ opacity: 0, y: -6, backgroundColor: 'rgba(254, 243, 199, 0.45)' }}
+                          animate={{ opacity: 1, y: 0, backgroundColor: 'rgba(255, 255, 255, 0)', x: 0 }}
+                          exit={{ opacity: 0, x: -100, transition: { duration: 0.15 } }}
+                          transition={{ duration: 0.25, ease: [0.16, 1, 0.3, 1] }}
+                          whileDrag={{ backgroundColor: 'rgba(254, 226, 226, 0.9)', boxShadow: '0 4px 12px rgba(220, 38, 38, 0.15)' }}
+                          className="hover:bg-slate-50/80 transition-colors cursor-grab active:cursor-grabbing touch-pan-y select-none"
+                        >
+                          <td className="py-2.5 pl-3 text-slate-400 text-xs">{idx + 1}</td>
+                          <td className="py-2.5 font-bold text-amber-700 text-sm">#{item.itemCode}</td>
+                          <td className="py-2.5 font-sans">
+                            <div className="font-bold text-slate-900 text-sm flex items-center gap-2">
+                              <span>{item.itemName}</span>
+                              <button
+                                type="button"
+                                onPointerDown={(e) => e.stopPropagation()}
+                                onClick={() => setActiveItemNoteIdx(idx)}
+                                className="text-[10px] text-slate-500 hover:text-amber-800 font-mono flex items-center gap-0.5 cursor-pointer bg-slate-100 hover:bg-amber-50 px-1.5 py-0.5 rounded border border-slate-200"
+                                title="Add Cooking Note"
+                              >
+                                <SlidersHorizontal className="w-2.5 h-2.5 text-amber-600" />
+                                <span>{item.notes ? item.notes : '+ Note'}</span>
+                              </button>
+                            </div>
+                          </td>
+                          <td className="py-2.5 text-center">
+                            <div 
+                              className="inline-flex items-center gap-2 bg-slate-50 px-2 py-0.5 rounded-lg border border-slate-200 shadow-2xs"
+                              onPointerDown={(e) => e.stopPropagation()}
                             >
-                              <SlidersHorizontal className="w-2.5 h-2.5 text-amber-600" />
-                              <span>{item.notes ? item.notes : '+ Note'}</span>
-                            </button>
-                          </div>
-                        </td>
-                        <td className="py-2.5 text-center">
-                          <div className="inline-flex items-center gap-2 bg-slate-50 px-2 py-0.5 rounded-lg border border-slate-200 shadow-2xs">
+                              <button
+                                onClick={() => handleUpdateCartQty(idx, item.quantity - 1)}
+                                className="text-slate-600 hover:text-amber-700 font-bold px-1.5 py-0.5 rounded hover:bg-slate-200 transition-colors cursor-pointer"
+                              >
+                                -
+                              </button>
+                              <span className="font-bold text-slate-900 text-sm min-w-[20px] text-center">{item.quantity}</span>
+                              <button
+                                onClick={() => handleUpdateCartQty(idx, item.quantity + 1)}
+                                className="text-slate-600 hover:text-amber-700 font-bold px-1.5 py-0.5 rounded hover:bg-slate-200 transition-colors cursor-pointer"
+                              >
+                                +
+                              </button>
+                            </div>
+                          </td>
+                          <td className="py-2.5 text-right text-slate-700 font-medium">₹{item.unitPrice}</td>
+                          <td className="py-2.5 text-right font-black text-slate-900 text-base">₹{item.totalPrice}</td>
+                          <td className="py-2.5 text-center">
                             <button
-                              onClick={() => handleUpdateCartQty(idx, item.quantity - 1)}
-                              className="text-slate-600 hover:text-amber-700 font-bold px-1.5 py-0.5 rounded hover:bg-slate-200 transition-colors cursor-pointer"
+                              onPointerDown={(e) => e.stopPropagation()}
+                              onClick={() => handleRemoveFromCart(idx)}
+                              className="p-1 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded transition-colors cursor-pointer"
+                              title="Remove item (or swipe left)"
                             >
-                              -
+                              <Trash2 className="w-4 h-4" />
                             </button>
-                            <span className="font-bold text-slate-900 text-sm min-w-[20px] text-center">{item.quantity}</span>
-                            <button
-                              onClick={() => handleUpdateCartQty(idx, item.quantity + 1)}
-                              className="text-slate-600 hover:text-amber-700 font-bold px-1.5 py-0.5 rounded hover:bg-slate-200 transition-colors cursor-pointer"
-                            >
-                              +
-                            </button>
-                          </div>
-                        </td>
-                        <td className="py-2.5 text-right text-slate-700 font-medium">₹{item.unitPrice}</td>
-                        <td className="py-2.5 text-right font-black text-slate-900 text-base">₹{item.totalPrice}</td>
-                        <td className="py-2.5 text-center">
-                          <button
-                            onClick={() => handleRemoveFromCart(idx)}
-                            className="p-1 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded transition-colors cursor-pointer"
-                            title="Remove item"
-                          >
-                            <Trash2 className="w-4 h-4" />
-                          </button>
-                        </td>
-                      </tr>
-                    ))}
+                          </td>
+                        </motion.tr>
+                      ))}
+                    </AnimatePresence>
                   </tbody>
                 </table>
               </>
@@ -1579,31 +1896,37 @@ export const DirectBilling: React.FC<DirectBillingProps> = ({ settings }) => {
           </div>
 
           {/* Totals & Calculations Section */}
-          <div className="bg-slate-50 border-t border-slate-200 p-3 space-y-2.5 shrink-0">
+          <div className="bg-slate-50 border-t border-slate-200 p-2 sm:p-3 space-y-2 sm:space-y-2.5 shrink-0">
             
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 items-center">
+            <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 items-stretch">
               
               {/* Subtotal */}
-              <div className="bg-white border border-slate-200 rounded-xl p-2.5 flex justify-between items-center shadow-2xs">
+              <div 
+                style={{ height: '45px', width: '100%' }} 
+                className="bg-white border border-slate-200 rounded-xl px-2.5 py-1 flex justify-between items-center shadow-2xs"
+              >
                 <div>
-                  <div className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Subtotal</div>
-                  <div className="text-xs text-slate-500">{cart.reduce((s, i) => s + i.quantity, 0)} items</div>
+                  <div className="text-[9px] font-bold text-slate-400 uppercase tracking-wider leading-none">Subtotal</div>
+                  <div className="text-[10px] text-slate-500 leading-tight">{cart.reduce((s, i) => s + i.quantity, 0)} items</div>
                 </div>
-                <div className="font-mono text-lg font-bold text-slate-800">
+                <div className="font-mono text-sm sm:text-base font-bold text-slate-800">
                   ₹{subtotal}
                 </div>
               </div>
 
               {/* Discount Details */}
-              <div className="bg-white border border-slate-200 rounded-xl p-2.5 flex justify-between items-center shadow-2xs">
+              <div 
+                style={{ height: '45px', width: '100%' }} 
+                className="bg-white border border-slate-200 rounded-xl px-2.5 py-1 flex justify-between items-center shadow-2xs"
+              >
                 <div>
-                  <div className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Discount</div>
-                  <div className="text-xs text-slate-500">
-                    {discountPercent !== null ? `${discountPercent}% applied` : 'Custom (₹)'}
+                  <div className="text-[9px] font-bold text-slate-400 uppercase tracking-wider leading-none">Discount</div>
+                  <div className="text-[10px] text-slate-500 leading-tight">
+                    {discountPercent !== null ? `${discountPercent}%` : 'Custom'}
                   </div>
                 </div>
                 {discountPercent !== null ? (
-                  <div className="font-mono text-base font-bold text-amber-600">
+                  <div className="font-mono text-xs sm:text-sm font-bold text-amber-600">
                     -₹{effectiveDiscount}
                   </div>
                 ) : (
@@ -1611,23 +1934,26 @@ export const DirectBilling: React.FC<DirectBillingProps> = ({ settings }) => {
                     type="number"
                     min="0"
                     max={subtotal}
-                    value={customDiscount === 0 ? '' : customDiscount}
+                    value={customDiscount > 0 ? customDiscount : ''}
                     onChange={(e) => setCustomDiscount(Math.max(0, parseFloat(e.target.value) || 0))}
                     placeholder="0"
-                    className="w-20 bg-slate-50 border border-slate-200 rounded-lg px-2 py-0.5 text-right font-mono text-sm font-bold text-slate-900 focus:outline-none focus:border-amber-500"
+                    className="w-12 sm:w-16 bg-slate-50 border border-slate-200 rounded px-1 text-right font-mono text-xs font-bold text-slate-900 focus:outline-none focus:border-amber-500"
                   />
                 )}
               </div>
 
               {/* Net Payable Grand Total */}
-              <div className="bg-emerald-600 text-white rounded-xl p-2.5 flex justify-between items-center shadow-md shadow-emerald-600/20">
+              <div 
+                style={{ height: '45px', width: '100%' }} 
+                className="col-span-2 sm:col-span-1 bg-emerald-600 text-white rounded-xl px-2.5 py-1 flex justify-between items-center shadow-md shadow-emerald-600/20"
+              >
                 <div>
-                  <div className="text-[10px] font-bold text-emerald-100 uppercase tracking-wider">Net Payable</div>
-                  <div className="text-[10px] text-emerald-100/90 font-mono">
+                  <div className="text-[9px] font-bold text-emerald-100 uppercase tracking-wider leading-none">Net Payable</div>
+                  <div className="text-[9px] text-emerald-100/90 font-mono leading-tight">
                     {tenderedNum > 0 ? `Change: ₹${returnChange}` : 'Grand Total'}
                   </div>
                 </div>
-                <div className="font-mono text-2xl sm:text-3xl font-black text-white tracking-tight">
+                <div className="font-mono text-base sm:text-lg lg:text-xl font-black text-white tracking-tight">
                   ₹{grandTotal}
                 </div>
               </div>
@@ -1642,11 +1968,25 @@ export const DirectBilling: React.FC<DirectBillingProps> = ({ settings }) => {
                 type="button"
                 onClick={handleHoldBill}
                 disabled={cart.length === 0}
-                className="py-3 px-4 rounded-xl text-xs font-bold bg-white hover:bg-slate-100 disabled:opacity-40 text-slate-700 border border-slate-200 flex items-center justify-center gap-1.5 transition-colors cursor-pointer shadow-2xs shrink-0"
-                title="Hold current bill"
+                className="py-2.5 sm:py-3 px-3 sm:px-4 rounded-xl text-xs font-bold bg-white hover:bg-slate-100 disabled:opacity-40 text-slate-700 border border-slate-200 flex items-center justify-center gap-1.5 transition-colors cursor-pointer shadow-2xs shrink-0"
+                title="Hold current bill (F8)"
               >
                 <RotateCcw className="w-3.5 h-3.5 text-slate-500" />
-                <span>Hold Bill</span>
+                <span className="hidden xs:inline">Hold Bill</span>
+                <span className="xs:hidden">Hold</span>
+              </button>
+
+              {/* Send to Kitchen as KOT */}
+              <button
+                type="button"
+                onClick={() => handleCreateKotFromBilling(true)}
+                disabled={cart.length === 0 || saving}
+                className="py-2.5 sm:py-3 px-3 sm:px-4 rounded-xl text-xs sm:text-sm font-bold bg-amber-500 hover:bg-amber-400 disabled:opacity-40 text-slate-950 flex items-center justify-center gap-1.5 transition-all shadow-md shadow-amber-500/20 cursor-pointer active:scale-[0.99] shrink-0"
+                title="Send to Kitchen as KOT (F9)"
+              >
+                <ChefHat className="w-4 h-4 text-slate-950" />
+                <span className="hidden xs:inline">Send KOT (F9)</span>
+                <span className="xs:hidden">KOT</span>
               </button>
 
               {/* 1-Click Print & Settle */}
@@ -1654,13 +1994,17 @@ export const DirectBilling: React.FC<DirectBillingProps> = ({ settings }) => {
                 type="button"
                 onClick={() => handleSaveBill(true, 'CASH')}
                 disabled={cart.length === 0 || saving}
-                className="flex-1 py-3 px-4 rounded-xl text-sm font-black bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 text-white flex items-center justify-center gap-2 transition-all shadow-md shadow-emerald-600/20 cursor-pointer active:scale-[0.99]"
-                title="Save and Print Bill (Ctrl)"
+                className="flex-1 py-2.5 sm:py-3 px-3 sm:px-4 rounded-xl text-xs sm:text-sm font-black bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 text-white flex items-center justify-center gap-1.5 sm:gap-2 transition-all shadow-md shadow-emerald-600/20 cursor-pointer active:scale-[0.99]"
+                title="Save and Print Bill (Tap [Ctrl] alone or [Ctrl+Enter])"
               >
                 <Printer className="w-4 h-4 stroke-[2.5]" />
-                <span>{saving ? 'Settling & Printing...' : `Save & Print Bill (₹${grandTotal})`}</span>
+                <span className="truncate">{saving ? 'Settling & Printing...' : `Print Bill [Ctrl] (₹${grandTotal})`}</span>
               </button>
 
+            </div>
+
+            <div className="text-[10px] text-slate-500 font-medium text-center flex items-center justify-center gap-1.5 pt-0.5">
+              <span>⚡ Tap <strong className="text-slate-800 font-mono bg-slate-200 px-1 py-0.5 rounded text-[10px]">[Ctrl]</strong> key to print directly to thermal printer without Google preview</span>
             </div>
 
           </div>
@@ -1747,7 +2091,7 @@ export const DirectBilling: React.FC<DirectBillingProps> = ({ settings }) => {
               <input
                 ref={searchInputRef}
                 type="text"
-                value={searchQuery}
+                value={searchQuery || ''}
                 onChange={(e) => setSearchQuery(e.target.value)}
                 placeholder="Search by code, item name, or category..."
                 className="flex-1 bg-transparent text-sm text-slate-900 placeholder-slate-400 focus:outline-none font-medium"
@@ -1796,13 +2140,22 @@ export const DirectBilling: React.FC<DirectBillingProps> = ({ settings }) => {
       )}
 
       {/* 80mm Thermal Receipt Preview Modal */}
-      <ThermalReceiptModal
-        bill={savedBill}
-        items={savedBillItems}
+      {isReceiptModalOpen && savedBill && (
+        <ThermalReceiptModal
+          bill={savedBill}
+          items={savedBillItems}
+          settings={settings}
+          isOpen={isReceiptModalOpen}
+          onClose={() => setIsReceiptModalOpen(false)}
+          isReprint={Boolean(savedBill && (savedBill.reprintCount || 0) > 0)}
+        />
+      )}
+
+      {/* Direct Hardware (0-Click Silent Thermal Print) Modal */}
+      <DirectHardwarePrintModal
+        isOpen={isHardwareModalOpen}
+        onClose={() => setIsHardwareModalOpen(false)}
         settings={settings}
-        isOpen={isReceiptModalOpen}
-        onClose={() => setIsReceiptModalOpen(false)}
-        isReprint={Boolean(savedBill && (savedBill.reprintCount || 0) > 0)}
       />
 
     </div>

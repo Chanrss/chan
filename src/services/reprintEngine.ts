@@ -11,6 +11,7 @@ import {
 } from 'firebase/firestore';
 import { db } from './firebase';
 import { Bill, BillItem } from '../types';
+import { getLocalBillByIdOrNumber, getLocalBillItems, updateLocalBill, getLocalBills } from './localBillStore';
 
 export class ReprintEngine {
   /**
@@ -20,14 +21,18 @@ export class ReprintEngine {
     const trimmed = searchParam.trim();
     if (!trimmed) return null;
 
-    // Check if input is a direct bill ID
+    // Check if input is a direct bill ID in Firestore
     if (trimmed.startsWith('bill_')) {
-      const docRef = doc(db, 'bills', trimmed);
-      const snap = await getDoc(docRef);
-      if (snap.exists()) {
-        const billData = snap.data() as Bill;
-        const items = await ReprintEngine.getBillItems(billData.id);
-        return { ...billData, items };
+      try {
+        const docRef = doc(db, 'bills', trimmed);
+        const snap = await getDoc(docRef);
+        if (snap.exists()) {
+          const billData = snap.data() as Bill;
+          const items = await ReprintEngine.getBillItems(billData.id);
+          return { ...billData, items };
+        }
+      } catch (e) {
+        console.warn('Firestore bill lookup notice:', e);
       }
     }
 
@@ -38,29 +43,39 @@ export class ReprintEngine {
       searchBillNum = `0${numVal}`;
     }
 
-    // Query bills collection
-    let billsQuery;
-    if (businessDate) {
-      billsQuery = query(
-        collection(db, 'bills'),
-        where('businessDate', '==', businessDate),
-        where('billNumber', '==', searchBillNum),
-        limit(1)
-      );
-    } else {
-      billsQuery = query(
-        collection(db, 'bills'),
-        where('billNumber', '==', searchBillNum),
-        orderBy('createdAt', 'desc'),
-        limit(1)
-      );
+    // Try Firestore query
+    try {
+      let billsQuery;
+      if (businessDate) {
+        billsQuery = query(
+          collection(db, 'bills'),
+          where('businessDate', '==', businessDate),
+          where('billNumber', '==', searchBillNum),
+          limit(1)
+        );
+      } else {
+        billsQuery = query(
+          collection(db, 'bills'),
+          where('billNumber', '==', searchBillNum),
+          orderBy('createdAt', 'desc'),
+          limit(1)
+        );
+      }
+
+      const querySnapshot = await getDocs(billsQuery);
+      if (!querySnapshot.empty) {
+        const billData = querySnapshot.docs[0].data() as Bill;
+        const items = await ReprintEngine.getBillItems(billData.id);
+        return { ...billData, items };
+      }
+    } catch (e) {
+      console.warn('Firestore bill search query notice, checking local store:', e);
     }
 
-    const querySnapshot = await getDocs(billsQuery);
-    if (!querySnapshot.empty) {
-      const billData = querySnapshot.docs[0].data() as Bill;
-      const items = await ReprintEngine.getBillItems(billData.id);
-      return { ...billData, items };
+    // Check local storage store
+    const localMatch = getLocalBillByIdOrNumber(trimmed, businessDate);
+    if (localMatch) {
+      return { ...localMatch.bill, items: localMatch.items };
     }
 
     return null;
@@ -70,31 +85,61 @@ export class ReprintEngine {
    * Fetches all snapshot items for a given bill ID
    */
   static async getBillItems(billId: string): Promise<BillItem[]> {
-    const itemsQuery = query(
-      collection(db, 'bill_items'),
-      where('billId', '==', billId)
-    );
-    const snap = await getDocs(itemsQuery);
-    return snap.docs.map((d) => d.data() as BillItem);
+    try {
+      const itemsQuery = query(
+        collection(db, 'bill_items'),
+        where('billId', '==', billId)
+      );
+      const snap = await getDocs(itemsQuery);
+      if (!snap.empty) {
+        return snap.docs.map((d) => d.data() as BillItem);
+      }
+    } catch (e) {
+      console.warn('Firestore bill items query notice, using local items:', e);
+    }
+
+    // Fallback to local store
+    return getLocalBillItems(billId);
   }
 
   /**
    * Records a reprint event without changing the bill number or altering bill items
    */
-  static async recordReprint(billId: string, reprintedBy: string): Promise<void> {
+  static async recordReprint(billId: string, reprintedBy: string): Promise<number> {
+    let newCount = 1;
+    // Update local storage record first
+    const localBills = getLocalBills();
+    const existing = localBills.find((b) => b.id === billId);
+    if (existing) {
+      newCount = (existing.reprintCount || 0) + 1;
+      updateLocalBill(billId, {
+        reprintCount: newCount,
+        lastReprintedAt: Date.now(),
+        lastReprintedBy: reprintedBy
+      });
+    }
+
+    // Skip remote Firestore calls for sample / test bills generated for instant test printing
+    if (!billId || billId.startsWith('sample_') || billId.startsWith('test_')) {
+      return newCount;
+    }
+
+    // Then update Firestore in background
     try {
       const billRef = doc(db, 'bills', billId);
       const billSnap = await getDoc(billRef);
       if (billSnap.exists()) {
-        const currentCount = billSnap.data().reprintCount || 0;
+        const currentCount = billSnap.data()?.reprintCount || 0;
+        newCount = currentCount + 1;
         await updateDoc(billRef, {
-          reprintCount: currentCount + 1,
+          reprintCount: newCount,
           lastReprintedAt: Date.now(),
           lastReprintedBy: reprintedBy
         });
       }
-    } catch (e) {
-      console.warn('Could not record reprint metadata:', e);
+    } catch (e: any) {
+      console.debug('Firestore reprint sync notice (saved locally):', e?.message || e);
     }
+    return newCount;
   }
 }

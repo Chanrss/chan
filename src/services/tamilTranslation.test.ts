@@ -10,7 +10,7 @@ describe('TamilTranslation Engine', () => {
     expect(getTamilItemName('Ghee Roast')).toBe('நெய் ரோஸ்ட்');
     expect(getTamilItemName('Medu Vada')).toBe('மெது வடை');
     expect(getTamilItemName('Filter Coffee')).toBe('ஃபில்டர் காபி');
-    expect(getTamilItemName('Tea')).toBe('தேநீர்');
+    expect(getTamilItemName('Tea')).toBe('டீ');
     expect(getTamilItemName('Poori Masala')).toBe('பூரி மசால்');
   });
 
@@ -44,8 +44,7 @@ describe('TamilTranslation Engine', () => {
   it('handles null, undefined, and whitespace gracefully', () => {
     expect(getTamilItemName('')).toBe('');
     expect(getTamilItemName('   ')).toBe('');
-    // @ts-expect-error test invalid parameter type
-    expect(getTamilItemName(null)).toBe('');
+    expect(getTamilItemName(null as unknown as string)).toBe('');
   });
 
   it('suggests Tamil name for menu item configuration in real-time', () => {

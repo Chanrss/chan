@@ -13,10 +13,15 @@ import { ReportsView } from './components/reports/ReportsView';
 import { UserManagement } from './components/users/UserManagement';
 import { SettingsView } from './components/settings/SettingsView';
 import { AuthModal } from './components/auth/AuthModal';
+import { PrintingReceiptAnimation } from './components/common/PrintingReceiptAnimation';
+import { DailyBackupNotificationToast } from './components/common/DailyBackupNotificationToast';
+import { DailyLowStockAlertModal, useDailyLowStockAlert } from './components/inventory/DailyLowStockAlertModal';
+import { useAutomatedDailyBackup } from './hooks/useAutomatedDailyBackup';
 import { RestaurantSettings } from './types';
 import { doc, onSnapshot } from 'firebase/firestore';
 import { db } from './services/firebase';
 import { DEFAULT_RESTAURANT_LOGO } from './data/defaultLogo';
+import { OFFICIAL_LOGO_STORAGE_PATH, OFFICIAL_LOGO_STORAGE_URL } from './services/brandLogoService';
 import { Zap, ShoppingBag, ChefHat, Receipt, MoreHorizontal, LayoutDashboard } from 'lucide-react';
 
 const AppContent: React.FC = () => {
@@ -26,32 +31,122 @@ const AppContent: React.FC = () => {
   const [authModalOpen, setAuthModalOpen] = useState(false);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
 
+  // Automated Daily Backup background manager and notifications
+  const { backupToast, dismissToast } = useAutomatedDailyBackup(settings);
+
+  // Daily 8:00 AM Low Stock Alert
+  const {
+    modalOpen: lowStockModalOpen,
+    lowStockItems,
+    handleDismiss: handleDismissLowStock,
+    handleViewInventory: handleViewInventoryLowStock
+  } = useDailyLowStockAlert(() => {
+    setActiveTab('inventory');
+    setMobileSidebarOpen(false);
+  });
+
   // Subscribe to Restaurant Settings in Firestore
   useEffect(() => {
     const unsub = onSnapshot(doc(db, 'settings', 'restaurant'), (snap) => {
       if (snap.exists()) {
         const data = snap.data() as RestaurantSettings;
+        // STRICT LOGO PRESERVATION: Use exact original uploaded logo file directly
+        // Disregard unreachable remote storage URLs that 404 and fallback to exact original asset
+        const rawStorageUrl = data.logoStorageUrl?.trim();
+        const rawLogoUrl = data.logoUrl?.trim();
+        // Zero-network guarantee: If a custom uploaded data URL is present, use it.
+        // Otherwise, fall back to DEFAULT_RESTAURANT_LOGO (the self-contained inline data URL)
+        // so that neither subpaths, sandboxes, nor iframe origins cause HTTP 404 broken images.
+        const isDataUrl = (rawStorageUrl?.startsWith('data:image/') || rawLogoUrl?.startsWith('data:image/'));
+        const updatedLogo = isDataUrl 
+          ? (rawStorageUrl?.startsWith('data:image/') ? rawStorageUrl : rawLogoUrl) 
+          : DEFAULT_RESTAURANT_LOGO;
+
         setSettings({
           ...data,
           restaurantName: data.restaurantName || 'SRI SARAVANA BHAVAN',
-          phone: data.phone || '+91 78100 66035 / 99769 74098',
+          restaurantNameTamil: data.restaurantNameTamil || 'ஸ்ரீ சரவண பவன்',
+          address: data.address || 'No:8A, Rajambal Nagar, Salem Main Rd, Anna Nagar, Kallakurichi-606213',
+          phone: data.phone || '7708159933',
           email: data.email || 'srisaravanabhavan57.com',
-          logoUrl: data.logoUrl || DEFAULT_RESTAURANT_LOGO
+          gstNumber: data.gstNumber || '',
+          logoUrl: updatedLogo,
+          logoStoragePath: data.logoStoragePath || OFFICIAL_LOGO_STORAGE_PATH,
+          logoStorageUrl: updatedLogo,
+          logoProtectedBrandAsset: true,
+          monochromeLogoUrl: data.monochromeLogoUrl || data.bwLogoUrl || '',
+          receiptHeader: data.receiptHeader || 'SRI SARAVANA BHAVAN',
+          receiptFooter: data.receiptFooter || '*** THANK YOU VISIT AGAIN ***',
+          businessDayStartHour: data.businessDayStartHour || '04:00',
+          billNumberDigits: data.billNumberDigits || 2,
+          paperWidth: data.paperWidth || '80mm',
+          receiptFontSize: data.receiptFontSize || 11,
+          receiptAlignment: 'center', // Top-center alignment
+          receiptLogoMaxWidth: (data.receiptLogoMaxWidth && data.receiptLogoMaxWidth >= 60) ? data.receiptLogoMaxWidth : 90,
+          receiptLogoMaxHeight: (data.receiptLogoMaxHeight && data.receiptLogoMaxHeight >= 60) ? data.receiptLogoMaxHeight : 90,
+          logoDisplay: (data.logoDisplay && data.logoDisplay !== 'watermark') ? data.logoDisplay : 'both',
+          watermarkOpacity: data.watermarkOpacity !== undefined ? data.watermarkOpacity : 0.12,
+          compactMode: data.compactMode !== undefined ? Boolean(data.compactMode) : true,
+          autoPrintOnSave: data.autoPrintOnSave !== undefined ? data.autoPrintOnSave : true,
+          skipPrintPreview: data.skipPrintPreview !== undefined ? Boolean(data.skipPrintPreview) : false,
         });
       } else {
         setSettings({
           restaurantName: 'SRI SARAVANA BHAVAN',
-          address: '104 Grand Avenue, Central Complex',
-          phone: '+91 78100 66035 / 99769 74098',
+          restaurantNameTamil: 'ஸ்ரீ சரவண பவன்',
+          address: 'No:8A, Rajambal Nagar, Salem Main Rd, Anna Nagar, Kallakurichi-606213',
+          phone: '7708159933',
           email: 'srisaravanabhavan57.com',
+          gstNumber: '',
           logoUrl: DEFAULT_RESTAURANT_LOGO,
+          logoStoragePath: OFFICIAL_LOGO_STORAGE_PATH,
+          logoStorageUrl: OFFICIAL_LOGO_STORAGE_URL,
+          logoProtectedBrandAsset: true,
+          monochromeLogoUrl: '',
           receiptHeader: 'SRI SARAVANA BHAVAN',
-          receiptFooter: 'Thank you for visiting! Please visit again.',
+          receiptFooter: '*** THANK YOU VISIT AGAIN ***',
+          businessDayStartHour: '04:00',
+          billNumberDigits: 2,
           paperWidth: '80mm',
-          receiptFontSize: 12,
-          autoPrintOnSave: true
+          receiptFontSize: 11,
+          receiptAlignment: 'center',
+          receiptLogoMaxWidth: 90,
+          receiptLogoMaxHeight: 90,
+          logoDisplay: 'both',
+          watermarkOpacity: 0.12,
+          compactMode: true,
+          autoPrintOnSave: true,
+          skipPrintPreview: false
         });
       }
+    }, (error) => {
+      console.warn('Restaurant settings firestore notice (using defaults):', error?.message || error);
+      setSettings({
+        restaurantName: 'SRI SARAVANA BHAVAN',
+        restaurantNameTamil: 'ஸ்ரீ சரவண பவன்',
+        address: 'No:8A, Rajambal Nagar, Salem Main Rd, Anna Nagar, Kallakurichi-606213',
+        phone: '7708159933',
+        email: 'srisaravanabhavan57.com',
+        gstNumber: '',
+        logoUrl: DEFAULT_RESTAURANT_LOGO,
+        logoStoragePath: OFFICIAL_LOGO_STORAGE_PATH,
+        logoStorageUrl: OFFICIAL_LOGO_STORAGE_URL,
+        logoProtectedBrandAsset: true,
+        receiptHeader: 'SRI SARAVANA BHAVAN',
+        receiptFooter: '*** THANK YOU VISIT AGAIN ***',
+        businessDayStartHour: '04:00',
+        billNumberDigits: 2,
+        paperWidth: '80mm',
+        receiptFontSize: 11,
+        receiptAlignment: 'center',
+        receiptLogoMaxWidth: 90,
+        receiptLogoMaxHeight: 90,
+        logoDisplay: 'both',
+        watermarkOpacity: 0.12,
+        compactMode: true,
+        autoPrintOnSave: true,
+        skipPrintPreview: false
+      });
     });
 
     return () => unsub();
@@ -74,14 +169,16 @@ const AppContent: React.FC = () => {
         settings={settings} 
         onOpenAuth={() => setAuthModalOpen(true)}
         onToggleSidebar={() => setMobileSidebarOpen(!mobileSidebarOpen)}
+        onNavigateSettings={() => setActiveTab('settings')}
       />
 
-      {/* Main Workspace */}
-      <div className="flex flex-1 overflow-hidden relative">
+      {/* Main Workspace with Standardized Vertical Grid System */}
+      <div className="flex-1 flex overflow-hidden relative md:grid md:grid-cols-[15rem_1fr] min-h-0">
         
-        {/* Role-gated Sidebar */}
+        {/* Role-gated Sidebar (Column 1: 15rem / 240px) */}
         <Sidebar 
           activeTab={activeTab} 
+          settings={settings}
           onSelectTab={(tab) => {
             setActiveTab(tab);
             setMobileSidebarOpen(false);
@@ -90,8 +187,8 @@ const AppContent: React.FC = () => {
           onCloseMobile={() => setMobileSidebarOpen(false)}
         />
 
-        {/* Dynamic Screen View Area with adaptive mobile/tablet scrolling */}
-        <main className="flex-1 flex flex-col min-w-0 bg-slate-50 overflow-y-auto lg:overflow-hidden relative pb-16 md:pb-0">
+        {/* Dynamic Screen View Area (Column 2: 1fr) */}
+        <main className="flex-1 flex flex-col min-w-0 bg-slate-50 overflow-y-auto relative pb-16 md:pb-0">
           {activeTab === 'dashboard' && (
             <Dashboard 
               settings={settings} 
@@ -192,6 +289,24 @@ const AppContent: React.FC = () => {
           <span className="text-[10px] mt-0.5 tracking-tight">More</span>
         </button>
       </nav>
+
+      {/* Global Thermal Receipt Printing Animation */}
+      <PrintingReceiptAnimation mode="toast-widget" settings={settings} />
+
+      {/* Daily 8:00 AM Low Stock Alert Modal */}
+      <DailyLowStockAlertModal 
+        isOpen={lowStockModalOpen}
+        lowStockItems={lowStockItems}
+        onClose={handleDismissLowStock}
+        onViewInventory={handleViewInventoryLowStock}
+      />
+
+      {/* Automated Daily Backup Complete Notification Toast */}
+      <DailyBackupNotificationToast 
+        toast={backupToast}
+        onDismiss={dismissToast}
+        onNavigateSettings={() => setActiveTab('settings')}
+      />
 
       {/* Firebase Auth Modal */}
       <AuthModal 

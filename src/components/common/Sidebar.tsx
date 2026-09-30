@@ -13,6 +13,9 @@ import {
   Sparkles
 } from 'lucide-react';
 import { useAuth } from '../../context/AuthContext';
+import { RestaurantSettings } from '../../types';
+import { DEFAULT_RESTAURANT_LOGO, SRI_SARAVANA_BHAVAN_SVG } from '../../data/defaultLogo';
+import { X } from 'lucide-react';
 
 export type NavTab = 
   | 'dashboard' 
@@ -31,13 +34,15 @@ interface SidebarProps {
   onSelectTab: (tab: NavTab) => void;
   isOpenMobile?: boolean;
   onCloseMobile?: () => void;
+  settings?: RestaurantSettings;
 }
 
 export const Sidebar: React.FC<SidebarProps> = ({ 
   activeTab, 
   onSelectTab, 
   isOpenMobile, 
-  onCloseMobile 
+  onCloseMobile,
+  settings
 }) => {
   const { hasPermission, isOwner, isManager, isWaiter } = useAuth();
 
@@ -122,14 +127,44 @@ export const Sidebar: React.FC<SidebarProps> = ({
 
       {/* Sidebar Navigation */}
       <aside 
-        className={`fixed md:static inset-y-0 left-0 z-40 w-60 bg-white text-slate-700 flex flex-col border-r border-slate-200 transition-transform duration-200 ease-in-out shadow-xs ${
+        className={`fixed md:static inset-y-0 left-0 z-40 w-64 md:w-full bg-white text-slate-700 flex flex-col border-r border-slate-200 transition-transform duration-200 ease-in-out shadow-xs ${
           isOpenMobile ? 'translate-x-0' : '-translate-x-full md:translate-x-0'
         }`}
       >
-        <div className="p-3 border-b border-slate-200">
-          <div className="text-[11px] font-semibold tracking-wider text-slate-400 uppercase px-3 py-1">
-            Navigation Menu
+        {/* Mobile Header with Official Logo */}
+        <div className="md:hidden flex items-center justify-between p-3.5 border-b border-slate-200 bg-amber-50/50">
+          <div className="flex items-center gap-2.5 min-w-0">
+            <div className="w-9 h-9 rounded-full bg-white border border-amber-400 shadow-2xs flex items-center justify-center p-0.5 shrink-0 overflow-hidden">
+              <img 
+                src={settings?.logoUrl || DEFAULT_RESTAURANT_LOGO} 
+                alt={settings?.restaurantName || 'SRI SARAVANA BHAVAN'} 
+                className="w-full h-full object-contain"
+                onError={(e) => {
+                  e.currentTarget.onerror = null;
+                  e.currentTarget.src = SRI_SARAVANA_BHAVAN_SVG;
+                }}
+              />
+            </div>
+            <div className="min-w-0">
+              <h2 className="font-bold text-xs uppercase tracking-wide text-slate-900 truncate">
+                {settings?.restaurantName || 'SRI SARAVANA BHAVAN'}
+              </h2>
+              {settings?.restaurantNameTamil && (
+                <p className="text-[10px] text-amber-700 font-bold truncate">
+                  {settings.restaurantNameTamil}
+                </p>
+              )}
+            </div>
           </div>
+          {onCloseMobile && (
+            <button
+              onClick={onCloseMobile}
+              className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100"
+              title="Close menu"
+            >
+              <X className="w-5 h-5" />
+            </button>
+          )}
         </div>
 
         <nav className="flex-1 px-2 py-3 space-y-1 overflow-y-auto">
@@ -161,18 +196,6 @@ export const Sidebar: React.FC<SidebarProps> = ({
             );
           })}
         </nav>
-
-        {/* Footer Quick Info */}
-        <div className="p-3 border-t border-slate-200 bg-slate-50 text-[11px] text-slate-500">
-          <div className="flex justify-between items-center text-slate-600">
-            <span>Thermal Size:</span>
-            <span className="font-mono font-bold text-amber-600">80mm / 3"</span>
-          </div>
-          <div className="flex justify-between items-center mt-1 text-slate-600">
-            <span>Tax/Payment:</span>
-            <span className="font-semibold text-emerald-600">Excluded</span>
-          </div>
-        </div>
       </aside>
     </>
   );

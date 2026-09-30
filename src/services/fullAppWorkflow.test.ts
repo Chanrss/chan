@@ -112,7 +112,7 @@ describe('Full POS Lifecycle Automated End-to-End Suite', () => {
 
     // 5. Thermal Receipt Generation (Original)
     const originalReceipt = PrinterService.generateThermalReceiptHTML(bill, items, restaurantSettings);
-    expect(originalReceipt).toContain('Sri Saravana Bhavan');
+    expect(originalReceipt).toContain('ஸ்ரீ சரவண பவன்');
     expect(originalReceipt).toContain('Bill No: #42');
     expect(originalReceipt).toContain('GSTIN: 33AABCS1429B1Z');
     expect(originalReceipt).toContain('FSSAI: 12423002000456');

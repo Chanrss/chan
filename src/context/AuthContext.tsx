@@ -3,7 +3,8 @@ import {
   onAuthStateChanged, 
   signInWithEmailAndPassword, 
   createUserWithEmailAndPassword, 
-  signInAnonymously,
+  GoogleAuthProvider,
+  signInWithPopup,
   signOut as fbSignOut, 
   User as FirebaseUser 
 } from 'firebase/auth';
@@ -11,6 +12,7 @@ import { doc, getDoc, setDoc, onSnapshot, collection, getDocs } from 'firebase/f
 import { auth, db } from '../services/firebase';
 import { AppUser, Role, UserRole } from '../types';
 import { DEFAULT_RESTAURANT_LOGO } from '../data/defaultLogo';
+import { OFFICIAL_LOGO_STORAGE_PATH, OFFICIAL_LOGO_STORAGE_URL } from '../services/brandLogoService';
 
 export const DEFAULT_PERMISSIONS = {
   OWNER: [
@@ -65,7 +67,12 @@ interface AuthContextType {
   loading: boolean;
   isOnline: boolean;
   login: (email: string, pass: string) => Promise<void>;
+  loginWithEmail: (email: string, pass: string) => Promise<void>;
   register: (email: string, pass: string, name: string, roleId: string) => Promise<void>;
+  registerWithEmail: (email: string, pass: string, name: string, roleId: string) => Promise<void>;
+  loginWithUsernameAndPin: (username: string, pin: string) => Promise<AppUser>;
+  registerWithUsernameAndPin: (username: string, pin: string, name: string, roleId: string) => Promise<AppUser>;
+  loginWithGoogle: () => Promise<void>;
   logout: () => Promise<void>;
   switchDemoRole: (role: UserRole) => void;
   hasPermission: (perm: string) => boolean;
@@ -144,12 +151,18 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
           await loadRole('owner');
         }
       } else {
-        // Automatically authenticate anonymously so Firestore operations are authenticated
+        const savedUserStr = localStorage.getItem('pos_logged_in_user');
+        if (savedUserStr) {
+          try {
+            const savedUser = JSON.parse(savedUserStr) as AppUser;
+            setCurrentUser(savedUser);
+            await loadRole(savedUser.roleId || 'owner');
+            setLoading(false);
+            return;
+          } catch (e) {}
+        }
         const savedDemoRole = (localStorage.getItem('pos_demo_role') as UserRole) || 'owner';
         applyDemoUser(savedDemoRole);
-        signInAnonymously(auth).catch((err) => {
-          console.warn('Anonymous auth note:', err);
-        });
       }
       setLoading(false);
     });
@@ -245,7 +258,254 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     }
   };
 
+  const loginWithGoogle = async () => {
+    setLoading(true);
+    try {
+      const provider = new GoogleAuthProvider();
+      const res = await signInWithPopup(auth, provider);
+      const userRef = doc(db, 'users', res.user.uid);
+      try {
+        const snap = await getDoc(userRef);
+        if (snap.exists()) {
+          const uData = snap.data() as AppUser;
+          setCurrentUser(uData);
+          await loadRole(uData.roleId || 'owner');
+        } else {
+          const newUser: AppUser = {
+            uid: res.user.uid,
+            name: res.user.displayName || res.user.email?.split('@')[0] || 'Staff Member',
+            email: res.user.email || '',
+            roleId: 'owner',
+            active: true,
+            createdAt: Date.now(),
+            updatedAt: Date.now(),
+            lastLoginAt: Date.now()
+          };
+          try {
+            await setDoc(userRef, newUser);
+          } catch (e) {
+            console.warn('Google user doc save notice:', e);
+          }
+          setCurrentUser(newUser);
+          await loadRole('owner');
+        }
+      } catch (e) {
+        console.warn('Google user fetch notice:', e);
+        const fallbackUser: AppUser = {
+          uid: res.user.uid,
+          name: res.user.displayName || res.user.email?.split('@')[0] || 'Admin Owner',
+          email: res.user.email || '',
+          roleId: 'owner',
+          active: true,
+          createdAt: Date.now(),
+          updatedAt: Date.now()
+        };
+        setCurrentUser(fallbackUser);
+        await loadRole('owner');
+      }
+    } catch (err: any) {
+      setLoading(false);
+      throw err;
+    }
+  };
+
+  const getKnownStaffList = async (): Promise<AppUser[]> => {
+    let deletedIds: string[] = [];
+    try {
+      const rawDeleted = localStorage.getItem('pos_deleted_user_ids');
+      if (rawDeleted) deletedIds = JSON.parse(rawDeleted);
+    } catch (e) {}
+
+    const localList: AppUser[] = [];
+    try {
+      const raw = localStorage.getItem('pos_local_users');
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+          localList.push(
+            ...parsed.filter((u: any) => !u.deleted && !deletedIds.includes(u.uid))
+          );
+        }
+      }
+    } catch (e) {}
+
+    const defaultStaff: AppUser[] = [
+      {
+        uid: 'user_owner',
+        username: 'owner',
+        pin: '1234',
+        name: 'Hotel Owner',
+        email: 'owner@hotelpos.local',
+        roleId: 'owner',
+        active: true,
+        createdAt: Date.now(),
+        updatedAt: Date.now()
+      },
+      {
+        uid: 'user_manager',
+        username: 'manager',
+        pin: '5678',
+        name: 'Restaurant Manager',
+        email: 'manager@hotelpos.local',
+        roleId: 'manager',
+        active: true,
+        createdAt: Date.now(),
+        updatedAt: Date.now()
+      },
+      {
+        uid: 'user_cashier',
+        username: 'cashier',
+        pin: '1111',
+        name: 'Counter Cashier',
+        email: 'cashier@hotelpos.local',
+        roleId: 'manager',
+        active: true,
+        createdAt: Date.now(),
+        updatedAt: Date.now()
+      },
+      {
+        uid: 'user_waiter',
+        username: 'waiter',
+        pin: '0000',
+        name: 'Floor Waiter',
+        email: 'waiter@hotelpos.local',
+        roleId: 'waiter',
+        active: true,
+        createdAt: Date.now(),
+        updatedAt: Date.now()
+      }
+    ].filter((u) => !deletedIds.includes(u.uid));
+
+    try {
+      const snap = await getDocs(collection(db, 'users'));
+      const firestoreUsers: AppUser[] = [];
+      snap.forEach((d) => {
+        const data = d.data() as any;
+        if (!data.deleted && !deletedIds.includes(d.id)) {
+          firestoreUsers.push({ uid: d.id, ...data } as AppUser);
+        }
+      });
+      if (firestoreUsers.length > 0) {
+        const map = new Map<string, AppUser>();
+        [...defaultStaff, ...localList, ...firestoreUsers].forEach((u) => {
+          if (u.username) map.set(u.username.toLowerCase(), u);
+          else if (u.uid) map.set(u.uid.toLowerCase(), u);
+        });
+        return Array.from(map.values());
+      }
+    } catch (e) {
+      // Offline fallback
+    }
+
+    const map = new Map<string, AppUser>();
+    [...defaultStaff, ...localList].forEach((u) => {
+      if (u.username) map.set(u.username.toLowerCase(), u);
+      else if (u.uid) map.set(u.uid.toLowerCase(), u);
+    });
+    return Array.from(map.values());
+  };
+
+  const loginWithUsernameAndPin = async (username: string, pin: string): Promise<AppUser> => {
+    setLoading(true);
+    try {
+      const cleanUser = username.trim().toLowerCase();
+      const cleanPin = pin.trim();
+
+      if (!cleanUser || !cleanPin) {
+        throw new Error('Please enter both username and PIN.');
+      }
+
+      const allStaff = await getKnownStaffList();
+      const matched = allStaff.find(
+        (u) => 
+          (u.username?.toLowerCase() === cleanUser || u.email?.toLowerCase().startsWith(cleanUser)) &&
+          (u.pin === cleanPin || (!u.pin && cleanPin === '1234'))
+      );
+
+      if (!matched) {
+        throw new Error('Invalid username or PIN. Please check your credentials.');
+      }
+
+      if (matched.active === false) {
+        throw new Error('This staff account is currently inactive.');
+      }
+
+      const updatedUser: AppUser = {
+        ...matched,
+        lastLoginAt: Date.now(),
+        updatedAt: Date.now()
+      };
+
+      try {
+        await setDoc(doc(db, 'users', updatedUser.uid), updatedUser, { merge: true });
+      } catch (e) {}
+
+      localStorage.setItem('pos_logged_in_user', JSON.stringify(updatedUser));
+      localStorage.setItem('pos_demo_role', updatedUser.roleId.toLowerCase());
+      setCurrentUser(updatedUser);
+      await loadRole(updatedUser.roleId);
+      return updatedUser;
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const registerWithUsernameAndPin = async (
+    username: string,
+    pin: string,
+    name: string,
+    roleId: string
+  ): Promise<AppUser> => {
+    setLoading(true);
+    try {
+      const cleanUser = username.trim().toLowerCase().replace(/[^a-z0-9_]/g, '');
+      const cleanPin = pin.trim();
+      const cleanName = name.trim();
+
+      if (!cleanName) throw new Error('Please enter staff full name.');
+      if (!cleanUser || cleanUser.length < 3) throw new Error('Username must be at least 3 alphanumeric characters.');
+      if (!cleanPin || cleanPin.length < 4) throw new Error('PIN must be at least 4 digits.');
+
+      const allStaff = await getKnownStaffList();
+      const existing = allStaff.find((u) => u.username?.toLowerCase() === cleanUser);
+      if (existing) {
+        throw new Error(`Username "${cleanUser}" is already taken. Please choose another.`);
+      }
+
+      const newUser: AppUser = {
+        uid: `user_${cleanUser}`,
+        username: cleanUser,
+        pin: cleanPin,
+        name: cleanName,
+        email: `${cleanUser}@hotelpos.local`,
+        roleId: roleId.toLowerCase(),
+        active: true,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        lastLoginAt: Date.now()
+      };
+
+      try {
+        await setDoc(doc(db, 'users', newUser.uid), newUser);
+      } catch (e) {
+        console.warn('Firestore user registration notice (saving locally):', e);
+      }
+
+      const currentLocals = allStaff.filter((u) => u.uid !== newUser.uid);
+      localStorage.setItem('pos_local_users', JSON.stringify([...currentLocals, newUser]));
+      localStorage.setItem('pos_logged_in_user', JSON.stringify(newUser));
+      localStorage.setItem('pos_demo_role', newUser.roleId.toLowerCase());
+
+      setCurrentUser(newUser);
+      await loadRole(roleId);
+      return newUser;
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const logout = async () => {
+    localStorage.removeItem('pos_logged_in_user');
     if (firebaseUser) {
       await fbSignOut(auth);
     }
@@ -293,7 +553,14 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
         tagline: 'AUTHENTIC TASTE & QUALITY',
         receiptHeader: 'SRI SARAVANA BHAVAN',
         receiptFooter: 'Thank you for visiting! Please visit again.',
-        logoUrl: DEFAULT_RESTAURANT_LOGO
+        logoUrl: DEFAULT_RESTAURANT_LOGO,
+        logoStoragePath: OFFICIAL_LOGO_STORAGE_PATH,
+        logoStorageUrl: OFFICIAL_LOGO_STORAGE_URL,
+        logoProtectedBrandAsset: true,
+        receiptAlignment: 'center',
+        receiptLogoMaxWidth: 90,
+        receiptLogoMaxHeight: 90,
+        logoDisplay: 'both'
       });
 
       await setDoc(doc(db, 'settings', 'billing'), {
@@ -386,7 +653,12 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
         loading,
         isOnline,
         login,
+        loginWithEmail: login,
         register,
+        registerWithEmail: register,
+        loginWithUsernameAndPin,
+        registerWithUsernameAndPin,
+        loginWithGoogle,
         logout,
         switchDemoRole,
         hasPermission,

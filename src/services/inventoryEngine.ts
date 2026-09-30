@@ -21,6 +21,7 @@ import {
   Wastage, 
   BillItem 
 } from '../types';
+import { syncCountInventoryOnSale } from './countInventoryService';
 
 export class InventoryEngine {
   /**
@@ -258,6 +259,13 @@ export class InventoryEngine {
  * Deducts inventory stock when a bill is completed
  */
 export async function recordInventorySale(billItems: BillItem[], userId: string): Promise<void> {
+  // Sync count-based items (Ice Cream, Cool Drinks, Water, etc.)
+  try {
+    await syncCountInventoryOnSale(billItems, userId, billItems[0]?.billId || '');
+  } catch (err) {
+    console.warn('Count inventory sale sync notice:', err);
+  }
+
   for (const item of billItems) {
     try {
       // Find matching inventory item by item code or itemId

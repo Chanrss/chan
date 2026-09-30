@@ -3,164 +3,331 @@ import {
   Wifi, 
   WifiOff, 
   Clock, 
-  User, 
-  ShieldCheck, 
   LogOut, 
   LogIn, 
   UtensilsCrossed, 
-  Store, 
-  RefreshCw,
-  Sparkles,
-  Menu as MenuIcon
+  Menu as MenuIcon,
+  Receipt,
+  Printer,
+  ExternalLink
 } from 'lucide-react';
 import { useAuth } from '../../context/AuthContext';
-import { RestaurantSettings, UserRole } from '../../types';
-import { DEFAULT_RESTAURANT_LOGO } from '../../data/defaultLogo';
+import { RestaurantSettings } from '../../types';
+import { DEFAULT_RESTAURANT_LOGO, SRI_SARAVANA_BHAVAN_SVG } from '../../data/defaultLogo';
+import { getBusinessDate, formatBillNumber } from '../../services/billNumberEngine';
+import { getLocalBills } from '../../services/localBillStore';
+import { doc, onSnapshot } from 'firebase/firestore';
+import { db } from '../../services/firebase';
+import { PrinterStatusService, PrinterHealthCheck } from '../../services/printerStatusService';
+import { PrinterTroubleshootModal } from './PrinterTroubleshootModal';
 
 interface HeaderProps {
   settings?: RestaurantSettings;
   onOpenAuth: () => void;
   onToggleSidebar?: () => void;
+  onNavigateSettings?: () => void;
 }
 
-export const Header: React.FC<HeaderProps> = ({ settings, onOpenAuth, onToggleSidebar }) => {
-  const { currentUser, currentRole, isOnline, switchDemoRole, logout, firebaseUser } = useAuth();
+export const Header: React.FC<HeaderProps> = ({ settings, onOpenAuth, onToggleSidebar, onNavigateSettings }) => {
+  const { currentUser, isOnline: authOnline, logout, firebaseUser } = useAuth();
+  const [networkOnline, setNetworkOnline] = useState<boolean>(navigator.onLine);
+  const [firestoreServerSynced, setFirestoreServerSynced] = useState<boolean>(false);
   const [time, setTime] = useState(new Date());
+  const [currentBillNo, setCurrentBillNo] = useState<string>('01');
+  const [printerCheck, setPrinterCheck] = useState<PrinterHealthCheck | null>(null);
+  const [showPrinterModal, setShowPrinterModal] = useState<boolean>(false);
+
+  // Subscribe to live printer status
+  useEffect(() => {
+    const unsub = PrinterStatusService.subscribe((check) => {
+      setPrinterCheck(check);
+    });
+    return unsub;
+  }, [settings]);
+
+  // Real-time connectivity listener using browser network listeners + Firestore onSnapshot metadata
+  useEffect(() => {
+    const handleOnline = () => setNetworkOnline(true);
+    const handleOffline = () => {
+      setNetworkOnline(false);
+      setFirestoreServerSynced(false);
+    };
+
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+
+    // Subscribe to Firestore metadata changes for deep cloud connectivity verification
+    let unsubscribe: (() => void) | null = null;
+    try {
+      const docRef = doc(db, 'settings', 'restaurant');
+      unsubscribe = onSnapshot(
+        docRef,
+        { includeMetadataChanges: true },
+        (snapshot) => {
+          // snapshot.metadata.fromCache is false when data was received directly from the Firestore backend server
+          const isFromCache = snapshot.metadata.fromCache;
+          if (!isFromCache) {
+            setFirestoreServerSynced(true);
+          }
+          if (navigator.onLine) {
+            setNetworkOnline(true);
+          }
+        },
+        (error) => {
+          // Gracefully handle offline / unavailable errors without breaking or crashing the app
+          console.debug('Firestore connectivity snapshot notice (operating in offline/cached mode):', error?.message);
+          setFirestoreServerSynced(false);
+          // If the device itself is offline, reflect offline state
+          if (!navigator.onLine) {
+            setNetworkOnline(false);
+          }
+        }
+      );
+    } catch (err) {
+      console.debug('Failed to attach Firestore connectivity listener:', err);
+    }
+
+    return () => {
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
+      if (unsubscribe) {
+        unsubscribe();
+      }
+    };
+  }, []);
+
+  const isCurrentlyOnline = networkOnline && authOnline !== false;
 
   useEffect(() => {
     const timer = setInterval(() => setTime(new Date()), 1000);
     return () => clearInterval(timer);
   }, []);
 
-  const roleColors: Record<string, string> = {
-    owner: 'bg-amber-100 text-amber-900 border-amber-300 dark:bg-amber-950 dark:text-amber-200',
-    manager: 'bg-blue-100 text-blue-900 border-blue-300 dark:bg-blue-950 dark:text-blue-200',
-    waiter: 'bg-emerald-100 text-emerald-900 border-emerald-300 dark:bg-emerald-950 dark:text-emerald-200'
+  const fetchCurrentBillNo = (): string => {
+    try {
+      const businessDate = getBusinessDate(settings?.businessDayStartHour || '04:00');
+      
+      // 1. Check local sequence counter for today
+      const localBillKey = `pos_last_bill_${businessDate}`;
+      const storedCounter = localStorage.getItem(localBillKey);
+      if (storedCounter && parseInt(storedCounter, 10) > 0) {
+        return formatBillNumber(parseInt(storedCounter, 10));
+      }
+
+      // 2. Check last printed bill in cache
+      const lastPrintedRaw = localStorage.getItem('pos_last_printed_bill');
+      if (lastPrintedRaw) {
+        const parsed = JSON.parse(lastPrintedRaw);
+        if (parsed?.bill?.billNumber) {
+          return parsed.bill.billNumber;
+        }
+      }
+
+      // 3. Check locally saved bills
+      const localBills = getLocalBills();
+      if (localBills.length > 0 && localBills[0].billNumber) {
+        return localBills[0].billNumber;
+      }
+    } catch (err) {
+      console.debug('Error getting current bill number:', err);
+    }
+    return '01';
   };
 
-  const userRoleKey = currentUser?.roleId?.toLowerCase() || 'owner';
+  useEffect(() => {
+    const updateBill = () => {
+      setCurrentBillNo(fetchCurrentBillNo());
+    };
+    updateBill();
+
+    // Listen to local bill updates and print events
+    window.addEventListener('pos_bills_updated', updateBill);
+    window.addEventListener('pos-bill-printing', updateBill);
+    window.addEventListener('storage', updateBill);
+    const interval = setInterval(updateBill, 3000);
+
+    return () => {
+      window.removeEventListener('pos_bills_updated', updateBill);
+      window.removeEventListener('pos-bill-printing', updateBill);
+      window.removeEventListener('storage', updateBill);
+      clearInterval(interval);
+    };
+  }, [settings?.businessDayStartHour]);
+
+  const dateString = time.toLocaleDateString('en-GB', {
+    day: '2-digit',
+    month: 'short',
+    year: 'numeric'
+  });
+
+  const timeString = time.toLocaleTimeString([], {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: true
+  });
 
   return (
-    <header className="bg-white text-slate-800 border-b border-slate-200 px-4 py-2.5 flex items-center justify-between sticky top-0 z-30 shadow-xs">
+    <header className="bg-white text-slate-800 border-b border-slate-200 sticky top-0 z-30 shadow-xs w-full max-w-full overflow-hidden text-left flex flex-row items-center justify-between md:grid md:grid-cols-[15rem_1fr]">
       
-      {/* Left: Branding & Mobile Menu Toggle */}
-      <div className="flex items-center gap-3">
+      {/* Left Column: Branding & Mobile Menu Toggle (Aligned vertically with Sidebar 15rem track) */}
+      <div className="flex items-center gap-2 sm:gap-3 px-3 sm:px-4 py-2 sm:py-2.5 md:border-r md:border-slate-200 min-w-0 h-full">
         {onToggleSidebar && (
           <button 
             onClick={onToggleSidebar}
-            className="md:hidden p-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-600"
+            className="md:hidden p-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-600 shrink-0 cursor-pointer"
             title="Toggle Menu"
           >
             <MenuIcon className="w-5 h-5" />
           </button>
         )}
 
-        <div className="flex items-center gap-2.5">
+        <div className="flex items-center gap-2.5 min-w-0">
           {(settings?.logoUrl || DEFAULT_RESTAURANT_LOGO) ? (
-            <div className="w-9 h-9 rounded-lg bg-white border border-slate-200 flex items-center justify-center p-0.5 shadow-xs overflow-hidden">
+            <div className="w-10 h-10 sm:w-11 sm:h-11 rounded-full bg-white border-2 border-amber-400/90 shadow-xs flex items-center justify-center p-0.5 shrink-0 transition-transform hover:scale-105 overflow-hidden">
               <img 
                 src={settings?.logoUrl || DEFAULT_RESTAURANT_LOGO} 
                 alt={settings?.restaurantName || 'SRI SARAVANA BHAVAN'} 
-                className="max-h-full max-w-full object-contain"
+                className="w-full h-full object-contain"
                 referrerPolicy="no-referrer"
+                onError={(e) => {
+                  e.currentTarget.onerror = null;
+                  e.currentTarget.src = SRI_SARAVANA_BHAVAN_SVG;
+                }}
               />
             </div>
           ) : (
-            <div className="w-9 h-9 rounded-lg bg-gradient-to-tr from-amber-500 to-amber-600 flex items-center justify-center shadow-xs text-white">
+            <div className="w-10 h-10 sm:w-11 sm:h-11 rounded-full bg-gradient-to-tr from-amber-500 to-amber-600 flex items-center justify-center shadow-xs text-white shrink-0">
               <UtensilsCrossed className="w-5 h-5 text-white" />
             </div>
           )}
-          <div>
-            <h1 className="font-bold text-sm sm:text-base leading-tight tracking-wide text-slate-900 uppercase">
+          <div className="min-w-0">
+            <h1 
+              style={{ fontFamily: 'Georgia, serif' }}
+              className="font-bold text-xs sm:text-base leading-tight tracking-wide text-slate-900 uppercase truncate max-w-[130px] xs:max-w-[180px] sm:max-w-xs md:max-w-none"
+            >
               {settings?.restaurantName || 'SRI SARAVANA BHAVAN'}
             </h1>
           </div>
         </div>
       </div>
 
-      {/* Middle: Live Clock & Date */}
-      <div className="hidden lg:flex items-center gap-3 px-3 py-1 bg-slate-50 rounded-lg border border-slate-200 text-xs font-mono text-slate-600">
-        <Clock className="w-3.5 h-3.5 text-amber-500" />
-        <span>
-          {time.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' })}
-        </span>
-        <span className="text-slate-300">|</span>
-        <span className="font-bold text-slate-800">
-          {time.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
-        </span>
-      </div>
-
-      {/* Right: Online Status, Role Switcher, Auth */}
-      <div className="flex items-center gap-2 sm:gap-3">
+      {/* Right Column: Current Bill No, Online & Offline Status, User Auth (Aligned vertically with Main Content track) */}
+      <div className="flex items-center justify-end gap-1.5 sm:gap-2.5 px-3 sm:px-4 py-2 sm:py-2.5 shrink-0 overflow-x-auto">
         
-        {/* Online / Offline status */}
+        {/* Current Bill No */}
         <div 
-          className={`flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold border ${
-            isOnline 
-              ? 'bg-emerald-50 text-emerald-700 border-emerald-200' 
-              : 'bg-red-50 text-red-700 border-red-200'
-          }`}
-          title={isOnline ? 'Cloud Synced' : 'Offline Mode - Local Persistence Active'}
+          id="header-current-bill-no" 
+          className="flex items-center gap-1 sm:gap-1.5 px-2 sm:px-2.5 py-1 rounded-lg text-[11px] sm:text-xs font-bold bg-amber-50 text-amber-900 border border-amber-300 font-mono shadow-2xs shrink-0"
+          title={`Current Business Day Bill No: #${currentBillNo}`}
         >
-          {isOnline ? (
-            <>
-              <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
-              <span className="hidden sm:inline">ONLINE</span>
-            </>
+          <Receipt className="w-3.5 h-3.5 text-amber-600 shrink-0" />
+          <span className="text-[10px] text-amber-700 uppercase font-bold hidden sm:inline">BILL NO:</span>
+          <span className="font-black text-amber-950 font-mono tracking-wide">#{currentBillNo}</span>
+        </div>
+
+        {/* Real-time Connectivity Indicator with Visual Dot (Green: Online, Red: Offline) */}
+        <div 
+          id="header-connectivity-status"
+          className={`flex items-center gap-1.5 sm:gap-2 px-2.5 sm:px-3 py-1 rounded-full text-[10px] sm:text-xs font-bold border shrink-0 transition-all shadow-2xs ${
+            isCurrentlyOnline 
+              ? 'bg-emerald-50 text-emerald-800 border-emerald-300' 
+              : 'bg-red-50 text-red-800 border-red-300'
+          }`}
+          title={
+            isCurrentlyOnline 
+              ? (firestoreServerSynced 
+                  ? 'Cloud Online: Firestore connected & live synced with server' 
+                  : 'Network Online: Firestore active (real-time sync enabled)')
+              : 'Offline Mode: Operating offline. All transactions saved locally and queued for auto-sync.'
+          }
+        >
+          {/* Visual Dot: Green when Online, Red when Offline */}
+          <span 
+            id="connectivity-status-dot"
+            className={`w-2 h-2 sm:w-2.5 sm:h-2.5 rounded-full shrink-0 transition-colors ${
+              isCurrentlyOnline 
+                ? 'bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.85)] animate-pulse' 
+                : 'bg-red-600 shadow-[0_0_8px_rgba(220,38,38,0.85)] animate-pulse'
+            }`} 
+          />
+          {isCurrentlyOnline ? (
+            <Wifi className="w-3 h-3 sm:w-3.5 sm:h-3.5 text-emerald-600 shrink-0" />
           ) : (
-            <>
-              <WifiOff className="w-3.5 h-3.5 text-red-500" />
-              <span>OFFLINE</span>
-            </>
+            <WifiOff className="w-3 h-3 sm:w-3.5 sm:h-3.5 text-red-600 shrink-0" />
           )}
         </div>
 
-        {/* Quick Role Switcher Dropdown (Seamless Testing & Real Role Simulation) */}
-        <div className="flex items-center bg-slate-50 rounded-lg border border-slate-200 p-0.5">
-          <label className="text-[10px] text-slate-500 px-2 font-medium hidden md:block">
-            ROLE:
-          </label>
-          <select
-            value={userRoleKey}
-            onChange={(e) => switchDemoRole(e.target.value as UserRole)}
-            className="bg-transparent text-xs font-semibold text-amber-700 focus:outline-none pr-1 py-1 cursor-pointer"
-            title="Switch User Role to test permissions"
-          >
-            <option value="owner" className="bg-white text-slate-900">👑 OWNER (Full)</option>
-            <option value="manager" className="bg-white text-slate-900">💼 MANAGER (No Sales Rev)</option>
-            <option value="waiter" className="bg-white text-slate-900">🍽️ WAITER (KOT Only)</option>
-          </select>
-        </div>
+        {/* Printer Status Badge with 1-click Quick Test & Connection Check */}
+        <button
+          type="button"
+          id="header-printer-status-btn"
+          onClick={() => setShowPrinterModal(true)}
+          className={`flex items-center gap-1.5 px-2.5 sm:px-3 py-1 rounded-full text-[10px] sm:text-xs font-bold border shrink-0 transition-all cursor-pointer shadow-2xs hover:scale-105 active:scale-95 ${
+            printerCheck?.status === 'OFFLINE'
+              ? 'bg-rose-50 text-rose-800 border-rose-300 hover:bg-rose-100'
+              : printerCheck?.status === 'MOCK'
+              ? 'bg-indigo-50 text-indigo-800 border-indigo-300 hover:bg-indigo-100'
+              : 'bg-emerald-50 text-emerald-800 border-emerald-300 hover:bg-emerald-100'
+          }`}
+          title={printerCheck?.summary || "Thermal Printer: Ready (Click to check connection or test print)"}
+        >
+          <span className={`w-2 h-2 rounded-full shrink-0 ${
+            printerCheck?.status === 'OFFLINE'
+              ? 'bg-rose-500 animate-pulse'
+              : printerCheck?.status === 'MOCK'
+              ? 'bg-indigo-500'
+              : 'bg-emerald-500 shadow-[0_0_6px_rgba(16,185,129,0.8)]'
+          }`} />
+          <Printer className={`w-3 h-3 sm:w-3.5 sm:h-3.5 ${
+            printerCheck?.status === 'OFFLINE' ? 'text-rose-600' : 'text-emerald-600'
+          }`} />
+          <span className="hidden xs:inline font-black tracking-wide">
+            {printerCheck?.label || 'PRINTER READY'}
+          </span>
+          {typeof window !== 'undefined' && window.self !== window.top && (
+            <ExternalLink className="w-2.5 h-2.5 text-emerald-700 ml-0.5" />
+          )}
+        </button>
 
         {/* User Badge / Account */}
-        <div className="flex items-center gap-2 pl-1">
+        <div className="flex items-center gap-1.5 sm:gap-2 pl-0.5 shrink-0">
           {firebaseUser ? (
-            <div className="flex items-center gap-1.5">
-              <div className="w-7 h-7 rounded-full bg-emerald-600 flex items-center justify-center text-xs font-bold text-white">
+            <div className="flex items-center gap-1 sm:gap-1.5">
+              <div 
+                className="w-6 h-6 sm:w-7 sm:h-7 rounded-full bg-emerald-600 flex items-center justify-center text-[10px] sm:text-xs font-bold text-white shadow-2xs"
+                title={`Signed in as: ${currentUser?.name || currentUser?.email || 'Staff'}`}
+              >
                 {currentUser?.name?.charAt(0) || 'U'}
               </div>
               <button
                 onClick={logout}
-                className="p-1.5 rounded-lg bg-slate-100 hover:bg-red-50 text-slate-500 hover:text-red-600 transition-colors"
+                className="p-1 sm:p-1.5 rounded-lg bg-slate-100 hover:bg-red-50 text-slate-500 hover:text-red-600 transition-colors cursor-pointer"
                 title="Sign Out"
               >
-                <LogOut className="w-4 h-4" />
+                <LogOut className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
               </button>
             </div>
           ) : (
             <button
               onClick={onOpenAuth}
-              className="px-2.5 py-1 text-xs bg-amber-500 hover:bg-amber-600 text-white font-semibold rounded-lg flex items-center gap-1.5 transition-colors cursor-pointer shadow-xs"
-              title="Sign In with Firebase Auth"
+              className="px-2 sm:px-2.5 py-1 text-[11px] sm:text-xs bg-amber-500 hover:bg-amber-600 text-white font-semibold rounded-lg flex items-center gap-1 sm:gap-1.5 transition-colors cursor-pointer shadow-xs"
+              title="Sign In"
             >
-              <LogIn className="w-3.5 h-3.5" />
-              <span className="hidden sm:inline">Firebase Sign In</span>
+              <LogIn className="w-3 h-3 sm:w-3.5 sm:h-3.5" />
+              <span className="hidden xs:inline">Sign In</span>
             </button>
           )}
         </div>
 
       </div>
 
+      <PrinterTroubleshootModal
+        isOpen={showPrinterModal}
+        onClose={() => setShowPrinterModal(false)}
+        settings={settings}
+        onNavigateSettings={onNavigateSettings}
+      />
     </header>
   );
 };

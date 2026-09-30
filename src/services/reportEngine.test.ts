@@ -3,6 +3,14 @@ import { ReportEngine } from './reportEngine';
 import { Bill, BillItem, Category } from '../types';
 import * as XLSX from 'xlsx';
 
+vi.mock('xlsx', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('xlsx')>();
+  return {
+    ...actual,
+    writeFile: vi.fn(),
+  };
+});
+
 vi.mock('./firebase', () => ({
   db: {}
 }));
@@ -150,14 +158,13 @@ describe('ReportEngine (Sales Analytics & Business Intelligence)', () => {
   });
 
   it('exports formatted report data to Excel spreadsheet workbook', () => {
-    const writeFileSpy = vi.spyOn(XLSX, 'writeFile').mockImplementation(() => {});
     const sampleData = [
       { 'Item Name': 'Masala Dosa', 'Qty Sold': 25, 'Total Sales (₹)': 1750 },
       { 'Item Name': 'Filter Coffee', 'Qty Sold': 40, 'Total Sales (₹)': 1200 }
     ];
 
     ReportEngine.exportToExcel(sampleData, 'daily_sales_august_28');
-    expect(writeFileSpy).toHaveBeenCalledWith(
+    expect(XLSX.writeFile).toHaveBeenCalledWith(
       expect.anything(),
       'daily_sales_august_28.xlsx'
     );

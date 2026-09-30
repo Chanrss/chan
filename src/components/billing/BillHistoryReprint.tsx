@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { 
   Receipt, 
   Search, 
@@ -9,17 +9,23 @@ import {
   CheckCircle, 
   AlertCircle,
   Eye,
-  FileText
+  FileText,
+  ChevronDown,
+  ChevronRight,
+  Clock,
+  Sparkles
 } from 'lucide-react';
 import { useAuth } from '../../context/AuthContext';
 import { Bill, BillItem, RestaurantSettings } from '../../types';
 import { ReprintEngine } from '../../services/reprintEngine';
 import { BillingEngine } from '../../services/billingEngine';
 import { PrinterService } from '../../services/printerService';
+import { getBusinessDate } from '../../services/billNumberEngine';
 import { ThermalReceiptModal } from '../common/ThermalReceiptModal';
 import { collection, onSnapshot, query, orderBy, limit } from 'firebase/firestore';
 import { db } from '../../services/firebase';
 import { MonthlyCalendarPicker } from '../common/MonthlyCalendarPicker';
+import { getLocalBills, mergeBills, subscribeToLocalBills } from '../../services/localBillStore';
 
 interface BillHistoryReprintProps {
   settings?: RestaurantSettings;
@@ -28,18 +34,33 @@ interface BillHistoryReprintProps {
 export const BillHistoryReprint: React.FC<BillHistoryReprintProps> = ({ settings }) => {
   const { currentUser, isOwner, isManager } = useAuth();
 
+  // Current business day calculated from restaurant settings
+  const todayBusinessDate = useMemo(() => {
+    return getBusinessDate(settings?.businessDayStartHour || '04:00');
+  }, [settings?.businessDayStartHour]);
+
   const [bills, setBills] = useState<Bill[]>([]);
   const [searchNumber, setSearchNumber] = useState('');
-  const [startDate, setStartDate] = useState(() => {
-    const d = new Date();
-    d.setDate(d.getDate() - 30);
-    return d.toISOString().split('T')[0];
-  });
-  const [endDate, setEndDate] = useState(() => new Date().toISOString().split('T')[0]);
+  
+  // By default, display ONLY the present day's bills
+  const [startDate, setStartDate] = useState<string>(() => todayBusinessDate);
+  const [endDate, setEndDate] = useState<string>(() => todayBusinessDate);
+  
+  // Track collapsed day sections when multiple days are displayed
+  const [collapsedDates, setCollapsedDates] = useState<{ [date: string]: boolean }>({});
+
   const [selectedBill, setSelectedBill] = useState<Bill | null>(null);
   const [selectedBillItems, setSelectedBillItems] = useState<BillItem[]>([]);
   const [loadingItems, setLoadingItems] = useState(false);
   const [loading, setLoading] = useState(true);
+
+  // Synchronize default dates when business date updates
+  useEffect(() => {
+    if (todayBusinessDate && (!startDate || startDate > todayBusinessDate)) {
+      setStartDate(todayBusinessDate);
+      setEndDate(todayBusinessDate);
+    }
+  }, [todayBusinessDate]);
 
   // Cancellation modal state
   const [cancelModalOpen, setCancelModalOpen] = useState(false);
@@ -51,17 +72,48 @@ export const BillHistoryReprint: React.FC<BillHistoryReprintProps> = ({ settings
   const [reprinting, setReprinting] = useState(false);
   const [notification, setNotification] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
 
-  // Fetch recent bills
+  // Fetch recent bills (with local storage merge and real-time subscription)
   useEffect(() => {
-    const q = query(collection(db, 'bills'), orderBy('createdAt', 'desc'), limit(50));
-    const unsub = onSnapshot(q, (snap) => {
-      const list: Bill[] = [];
-      snap.forEach((d) => list.push({ id: d.id, ...d.data() } as Bill));
-      setBills(list);
+    // 1. Prime with local bills first for 0ms immediate rendering
+    const local = getLocalBills();
+    if (local.length > 0) {
+      setBills(local);
       setLoading(false);
+    }
+
+    // 2. Listen to local bills updates (when new bills are saved in DirectBilling/POS)
+    const unsubLocal = subscribeToLocalBills(() => {
+      setBills((prev) => mergeBills(prev, getLocalBills()));
     });
 
-    return () => unsub();
+    // 3. Listen to Firestore collection
+    let unsubFirestore: (() => void) | undefined;
+    try {
+      const q = query(collection(db, 'bills'), orderBy('createdAt', 'desc'), limit(200));
+      unsubFirestore = onSnapshot(
+        q, 
+        (snap) => {
+          const remoteList: Bill[] = [];
+          snap.forEach((d) => remoteList.push({ id: d.id, ...d.data() } as Bill));
+          setBills(mergeBills(remoteList, getLocalBills()));
+          setLoading(false);
+        },
+        (err) => {
+          console.warn('Firestore bills snapshot notice (displaying local bills):', err?.message || err);
+          setBills(getLocalBills());
+          setLoading(false);
+        }
+      );
+    } catch (e) {
+      console.warn('Firestore bills query notice:', e);
+      setBills(getLocalBills());
+      setLoading(false);
+    }
+
+    return () => {
+      unsubLocal();
+      if (unsubFirestore) unsubFirestore();
+    };
   }, []);
 
   const handleSelectBill = async (bill: Bill) => {
@@ -93,6 +145,58 @@ export const BillHistoryReprint: React.FC<BillHistoryReprintProps> = ({ settings
       setTimeout(() => setNotification(null), 3000);
     } catch (err: any) {
       setNotification({ type: 'error', message: 'Search failed' });
+    }
+  };
+
+  // Direct reprint by bill number: Loads bill, generates receipt, and prints directly to default thermal printer
+  const handleDirectReprint = async (billToReprint?: Bill) => {
+    const targetBill = billToReprint || selectedBill;
+    if (!targetBill) return;
+
+    setReprinting(true);
+    try {
+      // 1. Ensure bill items are loaded
+      let itemsToPrint = (selectedBill?.id === targetBill.id && selectedBillItems.length > 0)
+        ? selectedBillItems
+        : [];
+
+      if (itemsToPrint.length === 0) {
+        setLoadingItems(true);
+        try {
+          itemsToPrint = await ReprintEngine.getBillItems(targetBill.id);
+          setSelectedBill(targetBill);
+          setSelectedBillItems(itemsToPrint);
+        } finally {
+          setLoadingItems(false);
+        }
+      }
+
+      // 2. Record duplicate reprint audit entry in Firestore
+      await ReprintEngine.recordReprint(targetBill.id, currentUser?.name || 'Staff');
+
+      // 3. Prepare updated bill with incremented reprint count
+      const nextCount = (targetBill.reprintCount || 0) + 1;
+      const updatedBill: Bill = { ...targetBill, reprintCount: nextCount };
+
+      // 4. Trigger direct thermal print using Chrome Kiosk Printing (no dialog, no preview)
+      PrinterService.printBill(updatedBill, itemsToPrint, settings, true);
+
+      // 5. Update local state
+      setSelectedBill(updatedBill);
+      setSelectedBillItems(itemsToPrint);
+      setBills((prev) => prev.map((b) => (b.id === updatedBill.id ? updatedBill : b)));
+
+      setNotification({
+        type: 'success',
+        message: `Reprinted Bill #${updatedBill.billNumber} (Duplicate #${nextCount}) directly to thermal printer!`
+      });
+      setTimeout(() => setNotification(null), 3500);
+    } catch (e) {
+      console.error('Thermal printer reprint failed:', e);
+      setNotification({ type: 'error', message: 'Failed to record or trigger reprint' });
+      setTimeout(() => setNotification(null), 3500);
+    } finally {
+      setReprinting(false);
     }
   };
 
@@ -179,32 +283,110 @@ export const BillHistoryReprint: React.FC<BillHistoryReprintProps> = ({ settings
     }
   };
 
-  const filteredBills = bills.filter((b) => {
-    const matchesDate = (!startDate || b.businessDate >= startDate) && (!endDate || b.businessDate <= endDate);
-    if (!matchesDate) return false;
-    if (!searchNumber) return true;
-    const q = searchNumber.toLowerCase();
-    return (
-      b.billNumber.toLowerCase().includes(q) ||
-      b.businessDate.includes(q) ||
-      (b.userName && b.userName.toLowerCase().includes(q)) ||
-      (b.tableNumber && b.tableNumber.toLowerCase().includes(q))
-    );
-  });
+  // 1. Filter bills by date and search term
+  const filteredBills = useMemo(() => {
+    return bills.filter((b) => {
+      const matchesDate = (!startDate || b.businessDate >= startDate) && (!endDate || b.businessDate <= endDate);
+      if (!matchesDate) return false;
+      if (!searchNumber) return true;
+      const q = searchNumber.toLowerCase();
+      return (
+        b.billNumber.toLowerCase().includes(q) ||
+        b.businessDate.includes(q) ||
+        (b.userName && b.userName.toLowerCase().includes(q)) ||
+        (b.tableNumber && b.tableNumber.toLowerCase().includes(q))
+      );
+    });
+  }, [bills, startDate, endDate, searchNumber]);
+
+  // 2. Group filtered bills by businessDate (Day-by-Day)
+  const groupedBillsByDate = useMemo(() => {
+    const groups: { [date: string]: Bill[] } = {};
+    for (const b of filteredBills) {
+      const d = b.businessDate || todayBusinessDate;
+      if (!groups[d]) {
+        groups[d] = [];
+      }
+      groups[d].push(b);
+    }
+
+    // Sort dates in descending order (newest date first)
+    const sortedDates = Object.keys(groups).sort((a, b) => b.localeCompare(a));
+    return sortedDates.map((date) => {
+      const dateBills = groups[date].sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+      const totalAmount = dateBills.reduce((sum, b) => b.status === 'COMPLETED' ? sum + b.grandTotal : sum, 0);
+      const isToday = date === todayBusinessDate;
+      return {
+        date,
+        isToday,
+        bills: dateBills,
+        billCount: dateBills.length,
+        totalAmount
+      };
+    });
+  }, [filteredBills, todayBusinessDate]);
+
+  // Determine if viewing only the present day
+  const isPresentDayOnly = (!startDate || startDate === todayBusinessDate) && (!endDate || endDate === todayBusinessDate);
+
+  const toggleDateCollapse = (date: string) => {
+    setCollapsedDates((prev) => ({
+      ...prev,
+      [date]: !prev[date]
+    }));
+  };
+
+  const handleResetToPresentDay = () => {
+    setStartDate(todayBusinessDate);
+    setEndDate(todayBusinessDate);
+    setSearchNumber('');
+  };
 
   return (
-    <div className="flex flex-col min-h-full lg:h-full bg-slate-100 text-slate-800 p-2.5 sm:p-4 gap-3 overflow-y-auto lg:overflow-hidden font-sans">
+    <div className="flex flex-col min-h-full bg-slate-100 text-slate-800 p-2.5 sm:p-4 gap-3 overflow-y-auto font-sans pb-24 md:pb-6">
       
       {/* Top Search & Filter Bar */}
       <div className="bg-white border border-slate-200 p-3 sm:p-4 rounded-2xl flex flex-wrap items-center justify-between gap-3 shadow-xs">
         <div className="flex items-center gap-2">
           <Receipt className="w-5 h-5 text-amber-600" />
-          <h2 className="font-bold text-sm sm:text-base tracking-wide text-slate-900">
-            Bill History & Thermal Reprint
-          </h2>
+          <div>
+            <div className="flex items-center gap-2">
+              <h2 className="font-bold text-sm sm:text-base tracking-wide text-slate-900">
+                Bill History & Thermal Reprint
+              </h2>
+              {isPresentDayOnly ? (
+                <span className="inline-flex items-center gap-1 text-[11px] font-bold text-emerald-800 bg-emerald-50 border border-emerald-300 px-2 py-0.5 rounded-full shadow-2xs">
+                  <Sparkles className="w-3 h-3 text-emerald-600" />
+                  Present Day
+                </span>
+              ) : (
+                <span className="inline-flex items-center gap-1 text-[11px] font-bold text-amber-800 bg-amber-50 border border-amber-300 px-2 py-0.5 rounded-full shadow-2xs">
+                  <Calendar className="w-3 h-3 text-amber-600" />
+                  Day-by-Day History
+                </span>
+              )}
+            </div>
+            <p className="text-[11px] text-slate-500 hidden sm:block">
+              {isPresentDayOnly
+                ? `Showing present bills for today (${todayBusinessDate}). Use date filter for day-by-day past records.`
+                : `Showing bills grouped day-by-day from ${startDate} to ${endDate}.`}
+            </p>
+          </div>
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
+          {!isPresentDayOnly && (
+            <button
+              type="button"
+              onClick={handleResetToPresentDay}
+              className="px-2.5 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 hover:text-slate-900 text-xs font-bold rounded-xl transition-colors cursor-pointer border border-slate-300 flex items-center gap-1 shadow-2xs"
+              title="Return to showing only present day's bills"
+            >
+              <RotateCcw className="w-3.5 h-3.5 text-amber-600" />
+              <span>Today's Bills</span>
+            </button>
+          )}
+
           <MonthlyCalendarPicker
             startDate={startDate}
             endDate={endDate}
@@ -221,7 +403,7 @@ export const BillHistoryReprint: React.FC<BillHistoryReprintProps> = ({ settings
               <input
                 type="text"
                 placeholder="Search Bill No (e.g. 01, 023)..."
-                value={searchNumber}
+                value={searchNumber || ''}
                 onChange={(e) => setSearchNumber(e.target.value)}
                 className="bg-slate-50 border border-slate-200 rounded-xl pl-9 pr-3 py-1.5 text-xs text-slate-900 placeholder-slate-400 focus:outline-none focus:border-amber-500 font-mono w-44 sm:w-52"
               />
@@ -251,10 +433,19 @@ export const BillHistoryReprint: React.FC<BillHistoryReprintProps> = ({ settings
       {/* 2-Column Split: Bill Records Table on Left, Details & Receipt Actions on Right */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-3 flex-1 min-h-0 lg:overflow-hidden">
         
-        {/* Left Column: Bills Table (7 cols) */}
+        {/* Left Column: Bills Table with Day-by-Day Sections (7 cols) */}
         <div className="lg:col-span-7 flex flex-col bg-white border border-slate-200 rounded-2xl overflow-hidden shadow-xs min-h-[340px] lg:min-h-0">
           <div className="p-3 bg-slate-50 border-b border-slate-200 flex justify-between items-center text-xs font-semibold text-slate-700 shrink-0">
-            <span>Recent Bills ({filteredBills.length})</span>
+            <div className="flex items-center gap-2">
+              <span>
+                {isPresentDayOnly ? "Present Day's Bills" : "Bills History"} ({filteredBills.length})
+              </span>
+              {!isPresentDayOnly && (
+                <span className="text-[11px] text-slate-500 font-normal">
+                  • {groupedBillsByDate.length} day{groupedBillsByDate.length > 1 ? 's' : ''}
+                </span>
+              )}
+            </div>
             <span className="text-[11px] text-slate-500">Sorted by newest</span>
           </div>
 
@@ -262,90 +453,166 @@ export const BillHistoryReprint: React.FC<BillHistoryReprintProps> = ({ settings
             {filteredBills.length === 0 ? (
               <div className="h-64 flex flex-col items-center justify-center text-slate-400 text-center p-4">
                 <Receipt className="w-10 h-10 text-slate-300 mb-2" />
-                <p className="font-semibold text-sm text-slate-700">No bills found</p>
-                <p className="text-xs text-slate-500">Save a bill in Direct Billing or POS to view history.</p>
+                <p className="font-semibold text-sm text-slate-700">
+                  {isPresentDayOnly ? "No bills recorded for today yet" : "No bills found for the selected period"}
+                </p>
+                <p className="text-xs text-slate-500 max-w-sm mt-1">
+                  {isPresentDayOnly
+                    ? "Bills created today in Direct Billing or POS will appear here for reprint. Use the date filter above to view past bills."
+                    : "Try expanding your date range or clearing the search query to find previous bills."}
+                </p>
+                {!isPresentDayOnly && (
+                  <button
+                    type="button"
+                    onClick={handleResetToPresentDay}
+                    className="mt-3 px-3 py-1.5 bg-amber-500 text-white text-xs font-bold rounded-xl shadow-xs cursor-pointer hover:bg-amber-600 transition-colors"
+                  >
+                    View Today's Bills
+                  </button>
+                )}
               </div>
             ) : (
-              <table className="w-full text-xs text-left min-w-[500px] sm:min-w-full">
-                <thead className="sticky top-0 bg-slate-50 border-b border-slate-200 text-slate-500 font-mono text-[10.5px] z-10">
-                  <tr>
-                    <th className="py-2.5 pl-3">Bill #</th>
-                    <th className="py-2.5">Date & Time</th>
-                    <th className="py-2.5">Type</th>
-                    <th className="py-2.5 text-right">Grand Total</th>
-                    <th className="py-2.5 text-center">Status</th>
-                    <th className="py-2.5 text-center pr-3">Actions</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-100 font-mono">
-                  {filteredBills.map((b) => (
-                    <tr
-                      key={b.id}
-                      onClick={() => handleSelectBill(b)}
-                      className={`hover:bg-slate-50 cursor-pointer transition-colors ${
-                        selectedBill?.id === b.id ? 'bg-amber-50/70 border-l-2 border-amber-500' : ''
-                      }`}
-                    >
-                      <td className="py-2.5 pl-3 font-bold text-amber-700">
-                        {b.billNumber}
-                        {b.reprintCount > 0 && (
-                          <span className="ml-1 text-[9px] bg-amber-100 text-amber-800 font-bold px-1.5 py-0.5 rounded-md">
-                            R:{b.reprintCount}
+              <div className="divide-y divide-slate-200">
+                {groupedBillsByDate.map((group) => {
+                  const isCollapsed = Boolean(collapsedDates[group.date]);
+                  return (
+                    <div key={group.date} className="border-b last:border-b-0 border-slate-200">
+                      {/* Day Group Header (Day-by-Day Divider with Date & Daily Total) */}
+                      <div 
+                        onClick={() => toggleDateCollapse(group.date)}
+                        className={`px-3 py-2 flex items-center justify-between cursor-pointer select-none transition-colors ${
+                          group.isToday 
+                            ? 'bg-amber-50/80 hover:bg-amber-100/70 border-l-4 border-amber-500' 
+                            : 'bg-slate-100/80 hover:bg-slate-200/70 border-l-4 border-slate-400'
+                        }`}
+                      >
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            className="text-slate-600 p-0.5 rounded hover:bg-black/5"
+                          >
+                            {isCollapsed ? (
+                              <ChevronRight className="w-4 h-4 text-slate-500" />
+                            ) : (
+                              <ChevronDown className="w-4 h-4 text-slate-500" />
+                            )}
+                          </button>
+                          <Calendar className={`w-3.5 h-3.5 ${group.isToday ? 'text-amber-600' : 'text-slate-500'}`} />
+                          <span className="font-mono font-bold text-xs text-slate-900">
+                            {group.date}
                           </span>
-                        )}
-                      </td>
-                      <td className="py-2.5 text-slate-700 font-sans">
-                        <div className="text-[11px] font-mono font-medium">{b.businessDate}</div>
-                        <div className="text-[10px] text-slate-500">
-                          {new Date(b.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                          {group.isToday && (
+                            <span className="text-[10px] font-black uppercase tracking-wider bg-emerald-600 text-white px-1.5 py-0.2 rounded">
+                              Present Day
+                            </span>
+                          )}
+                          <span className="text-[11px] text-slate-500 font-sans">
+                            ({group.billCount} {group.billCount === 1 ? 'bill' : 'bills'})
+                          </span>
                         </div>
-                      </td>
-                      <td className="py-2.5 text-slate-600 font-sans text-[11px]">
-                        <div>{b.orderType === 'DINE_IN' ? 'Dine In' : 'Take Away'}</div>
-                        <div className="text-[10px] text-amber-700 font-mono">{b.priceType}</div>
-                      </td>
-                      <td className="py-2.5 text-right font-bold text-slate-900 text-sm">
-                        ₹{b.grandTotal}
-                      </td>
-                      <td className="py-2.5 text-center">
-                        <span className={`text-[10px] uppercase font-bold px-1.5 py-0.5 rounded-full ${
-                          b.status === 'COMPLETED'
-                            ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
-                            : 'bg-red-50 text-red-700 border border-red-200'
-                        }`}>
-                          {b.status}
-                        </span>
-                      </td>
-                      <td className="py-2.5 text-center pr-3">
-                        <div className="flex items-center justify-center gap-1">
-                          <button
-                            type="button"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              handleSelectBill(b);
-                            }}
-                            className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100 transition-colors cursor-pointer"
-                            title="View bill details"
-                          >
-                            <Eye className="w-3.5 h-3.5" />
-                          </button>
-                          <button
-                            type="button"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              handleOpenReprintPreview(b);
-                            }}
-                            className="p-1.5 rounded-lg text-amber-600 hover:text-amber-700 hover:bg-amber-50 transition-colors cursor-pointer"
-                            title={`Preview & Reprint Bill #${b.billNumber}`}
-                          >
-                            <Printer className="w-3.5 h-3.5" />
-                          </button>
+
+                        <div className="flex items-center gap-3">
+                          <span className="font-mono text-xs font-bold text-slate-800">
+                            Total: <span className="text-emerald-700 font-black">₹{group.totalAmount.toLocaleString()}</span>
+                          </span>
+                          <span className="text-[10px] text-slate-400 font-sans">
+                            {isCollapsed ? 'Click to expand' : 'Click to collapse'}
+                          </span>
                         </div>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+                      </div>
+
+                      {/* Day Bills Table */}
+                      {!isCollapsed && (
+                        <table className="w-full text-xs text-left min-w-[500px] sm:min-w-full">
+                          <thead className="bg-slate-50 border-b border-slate-200 text-slate-500 font-mono text-[10px]">
+                            <tr>
+                              <th className="py-2 pl-3">Bill #</th>
+                              <th className="py-2">Time</th>
+                              <th className="py-2">Type</th>
+                              <th className="py-2 text-right">Grand Total</th>
+                              <th className="py-2 text-center">Status</th>
+                              <th className="py-2 text-center pr-3">Actions</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-slate-100 font-mono bg-white">
+                            {group.bills.map((b) => (
+                              <tr
+                                key={b.id}
+                                onClick={() => handleSelectBill(b)}
+                                className={`hover:bg-slate-50 cursor-pointer transition-colors ${
+                                  selectedBill?.id === b.id ? 'bg-amber-50/70 border-l-2 border-amber-500' : ''
+                                }`}
+                              >
+                                <td className="py-2.5 pl-3 font-bold text-amber-700">
+                                  {b.billNumber}
+                                  {b.reprintCount > 0 && (
+                                    <span className="ml-1 text-[9px] bg-amber-100 text-amber-800 font-bold px-1.5 py-0.5 rounded-md">
+                                      R:{b.reprintCount}
+                                    </span>
+                                  )}
+                                </td>
+                                <td className="py-2.5 text-slate-700 font-sans">
+                                  <div className="text-[11px] font-mono text-slate-700 flex items-center gap-1">
+                                    <Clock className="w-3 h-3 text-slate-400" />
+                                    {new Date(b.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                                  </div>
+                                  {b.userName && (
+                                    <div className="text-[10px] text-slate-500 truncate max-w-[120px]">
+                                      {b.userName}
+                                    </div>
+                                  )}
+                                </td>
+                                <td className="py-2.5 text-slate-600 font-sans text-[11px]">
+                                  <div>{b.orderType === 'DINE_IN' ? 'Dine In' : 'Take Away'}</div>
+                                  <div className="text-[10px] text-amber-700 font-mono">{b.priceType}</div>
+                                </td>
+                                <td className="py-2.5 text-right font-bold text-slate-900 text-sm">
+                                  ₹{b.grandTotal}
+                                </td>
+                                <td className="py-2.5 text-center">
+                                  <span className={`text-[10px] uppercase font-bold px-1.5 py-0.5 rounded-full ${
+                                    b.status === 'COMPLETED'
+                                      ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+                                      : 'bg-red-50 text-red-700 border border-red-200'
+                                  }`}>
+                                    {b.status}
+                                  </span>
+                                </td>
+                                <td className="py-2.5 text-center pr-3">
+                                  <div className="flex items-center justify-center gap-1">
+                                    <button
+                                      type="button"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        handleSelectBill(b);
+                                      }}
+                                      className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100 transition-colors cursor-pointer"
+                                      title="View bill details"
+                                    >
+                                      <Eye className="w-3.5 h-3.5" />
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        handleDirectReprint(b);
+                                      }}
+                                      className="p-1.5 rounded-lg text-amber-600 hover:text-amber-700 hover:bg-amber-50 transition-colors cursor-pointer"
+                                      title={`Direct Thermal Reprint Bill #${b.billNumber}`}
+                                    >
+                                      <Printer className="w-3.5 h-3.5" />
+                                    </button>
+                                  </div>
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
             )}
           </div>
         </div>
@@ -447,17 +714,29 @@ export const BillHistoryReprint: React.FC<BillHistoryReprintProps> = ({ settings
                   </button>
                 )}
 
-                {/* Reprint Thermal Receipt - Opens Preview Modal First */}
+                {/* Direct Thermal Reprint via Chrome Kiosk Printing */}
+                <button
+                  type="button"
+                  onClick={() => handleDirectReprint(selectedBill)}
+                  disabled={loadingItems || reprinting}
+                  className="flex-1 py-2.5 px-4 rounded-xl bg-amber-500 hover:bg-amber-600 active:bg-amber-700 text-white text-xs font-bold flex items-center justify-center gap-2 shadow-xs cursor-pointer transition-colors disabled:opacity-50"
+                  title="Directly send duplicate bill to default thermal printer"
+                >
+                  <Printer className="w-4 h-4" />
+                  <span>
+                    {reprinting ? 'Printing...' : `Reprint Bill #${selectedBill.billNumber}`}
+                  </span>
+                </button>
+
+                {/* Optional On-Screen Preview Button */}
                 <button
                   type="button"
                   onClick={() => handleOpenReprintPreview(selectedBill)}
                   disabled={loadingItems}
-                  className="flex-1 py-2.5 px-4 rounded-xl bg-amber-500 hover:bg-amber-600 active:bg-amber-700 text-white text-xs font-bold flex items-center justify-center gap-2 shadow-xs cursor-pointer transition-colors disabled:opacity-50"
-                  title="Preview receipt before sending to thermal printer"
+                  className="p-2.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-600 hover:text-slate-900 transition-colors cursor-pointer"
+                  title="View on-screen receipt preview"
                 >
                   <Eye className="w-4 h-4" />
-                  <Printer className="w-4 h-4" />
-                  <span>Preview & Reprint (Bill #{selectedBill.billNumber})</span>
                 </button>
 
               </div>
@@ -490,7 +769,7 @@ export const BillHistoryReprint: React.FC<BillHistoryReprintProps> = ({ settings
 
             <textarea
               rows={3}
-              value={cancelReason}
+              value={cancelReason || ''}
               onChange={(e) => setCancelReason(e.target.value)}
               placeholder="e.g. Customer changed mind, wrong items entered..."
               className="w-full bg-slate-50 border border-slate-200 rounded-xl p-2.5 text-xs text-slate-900 focus:outline-none focus:border-red-500"
@@ -516,17 +795,19 @@ export const BillHistoryReprint: React.FC<BillHistoryReprintProps> = ({ settings
       )}
 
       {/* Thermal Receipt Preview Modal (Triggered for Reprinting Receipt) */}
-      <ThermalReceiptModal
-        bill={selectedBill}
-        items={selectedBillItems}
-        settings={settings}
-        isOpen={isReceiptOpen}
-        onClose={() => setIsReceiptOpen(false)}
-        onPrint={handleConfirmPrintReprint}
-        isReprint={true}
-        printButtonText="Confirm & Print Reprint"
-        isPrinting={reprinting}
-      />
+      {isReceiptOpen && selectedBill && (
+        <ThermalReceiptModal
+          bill={selectedBill}
+          items={selectedBillItems}
+          settings={settings}
+          isOpen={isReceiptOpen}
+          onClose={() => setIsReceiptOpen(false)}
+          onPrint={handleConfirmPrintReprint}
+          isReprint={true}
+          printButtonText="Confirm & Print Reprint"
+          isPrinting={reprinting}
+        />
+      )}
 
     </div>
   );

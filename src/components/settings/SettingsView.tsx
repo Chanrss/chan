@@ -1,4 +1,5 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect } from 'react';
+import { motion, AnimatePresence } from 'motion/react';
 import { 
   Settings, 
   Store, 
@@ -14,28 +15,56 @@ import {
   Image as ImageIcon,
   Trash2,
   Eye,
-  Link,
   Flame,
   Coffee,
   Crown,
-  Utensils,
-  Receipt,
   Type,
-  Sliders
+  Sliders,
+  CheckCircle2,
+  Activity,
+  FileText,
+  ChevronDown,
+  ChevronUp,
+  Leaf,
+  AlignLeft,
+  AlignCenter,
+  AlignRight,
+  Download,
+  HardDrive,
+  Terminal,
+  Zap
 } from 'lucide-react';
 import { useAuth } from '../../context/AuthContext';
-import { RestaurantSettings } from '../../types';
+import { RestaurantSettings, Bill, BillItem } from '../../types';
 import { doc, setDoc } from 'firebase/firestore';
 import { db } from '../../services/firebase';
 import { DEFAULT_RESTAURANT_LOGO } from '../../data/defaultLogo';
+import { OFFICIAL_LOGO_STORAGE_PATH, OFFICIAL_LOGO_STORAGE_URL, OFFICIAL_LOGO_PUBLIC_URL } from '../../services/brandLogoService';
+import { PrintDiagnosticsCard } from './PrintDiagnosticsCard';
+import { TestPrintLog } from './TestPrintLog';
+import { PrinterDiagnosticView } from './PrinterDiagnosticView';
+import { PrinterService } from '../../services/printerService';
+import { CentralizedLogoProcessor } from './CentralizedLogoProcessor';
+import { TestPrintModal } from './TestPrintModal';
+import { RawEscPosTestModal } from './RawEscPosTestModal';
+import { downloadDatabaseBackup, downloadCoreBillingBackup } from '../../services/backupService';
+import { DailyBackupSettingsCard } from './DailyBackupSettingsCard';
+import { PrinterTroubleshootModal } from '../common/PrinterTroubleshootModal';
+import { RugtekPrinterPairingSection } from './RugtekPrinterPairingSection';
+import { PrinterConnectionService } from '../../services/printerConnectionService';
+import { ConnectedPrinterInfo } from '../../types';
+import { ReceiptDesignerSection } from './ReceiptDesignerSection';
+import { LiveReceiptPreview } from './LiveReceiptPreview';
 
 interface SettingsViewProps {
   settings?: RestaurantSettings;
   onRefreshSettings?: () => void;
 }
 
-// Preset vector logos encoded for instant 1-click preview and zero-latency thermal printing
-const SAMPLE_PRESET_LOGOS = [
+type SettingsTab = 'store' | 'logo' | 'receipt' | 'hardware' | 'diagnostic';
+
+// Preset sample logos for instant switching
+const LOGO_PRESETS = [
   {
     id: 'sri_saravana_bhavan',
     name: 'Sri Saravana Bhavan (SSB)',
@@ -63,171 +92,258 @@ const SAMPLE_PRESET_LOGOS = [
 ];
 
 export const SettingsView: React.FC<SettingsViewProps> = ({ settings: initialSettings, onRefreshSettings }) => {
-  const { isOwner, bootstrapSystem } = useAuth();
-  const fileInputRef = useRef<HTMLInputElement>(null);
+  const { bootstrapSystem } = useAuth();
+  const [activeTab, setActiveTab] = useState<SettingsTab>('store');
 
   const [formData, setFormData] = useState<RestaurantSettings>({
     restaurantName: 'SRI SARAVANA BHAVAN',
-    address: '104 Grand Avenue, Central Complex',
-    phone: '+91 78100 66035 / 99769 74098',
+    restaurantNameTamil: 'ஸ்ரீ சரவண பவன்',
+    address: 'No:8A, Rajambal Nagar, Salem Main Rd, Anna Nagar, Kallakurichi-606213',
+    phone: '7708159933',
     email: 'srisaravanabhavan57.com',
+    gstNumber: '',
+    fssaiNumber: '',
     logoUrl: DEFAULT_RESTAURANT_LOGO,
+    monochromeLogoUrl: '',
     receiptHeader: 'SRI SARAVANA BHAVAN',
-    receiptFooter: 'Thank you for visiting! Please visit again.',
+    receiptFooter: '*** THANK YOU VISIT AGAIN ***',
     businessDayStartHour: '04:00',
     billNumberDigits: 2,
     paperWidth: '80mm',
-    receiptFontSize: 12,
+    receiptFontSize: 11,
+    receiptAlignment: 'center',
+    receiptLogoMaxWidth: 85,
+    receiptLogoMaxHeight: 85,
+    logoDisplay: 'both',
+    watermarkOpacity: 0.12,
+    compactMode: true,
+    receiptFormat: 'standard',
+    receiptHeaderFontSize: 'large',
+    receiptItemFontSize: 'normal',
+    receiptTotalFontSize: 'xlarge',
+    receiptLineSpacing: 'tight',
+    receiptSectionSpacing: 'compact',
+    receiptItemPadding: 'condensed',
+    receiptPaperMargin: '1mm',
+    receiptShowItemSl: true,
+    receiptShowTotalQty: true,
+    receiptShowAddress: true,
+    receiptShowPhone: true,
+    receiptShowGstFssai: true,
+    receiptShowTamilName: true,
+    receiptShowEnglishName: false,
+    receiptFeedLines: 2,
     autoPrintOnSave: true,
+    skipPrintPreview: false,
     updatedAt: Date.now()
   });
 
   const [saving, setSaving] = useState(false);
   const [bootstrapping, setBootstrapping] = useState(false);
-  const [processingImage, setProcessingImage] = useState(false);
-  const [dragOver, setDragOver] = useState(false);
-  const [logoInputTab, setLogoInputTab] = useState<'upload' | 'url' | 'presets'>('upload');
-  const [customUrlInput, setCustomUrlInput] = useState('');
   const [notification, setNotification] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
+  const [isTestingPrint, setIsTestingPrint] = useState(false);
+  const [isPrintingSample, setIsPrintingSample] = useState(false);
+  const [showTestPrintModal, setShowTestPrintModal] = useState(false);
+  const [showRawEscPosModal, setShowRawEscPosModal] = useState(false);
+  const [showTroubleshootModal, setShowTroubleshootModal] = useState(false);
+  const [showDiagnostics, setShowDiagnostics] = useState(false);
+  const [connectedPrinter, setConnectedPrinter] = useState<ConnectedPrinterInfo>(() =>
+    PrinterConnectionService.getConnectedPrinter()
+  );
+
+  useEffect(() => {
+    const unsub = PrinterConnectionService.subscribe((info) => {
+      setConnectedPrinter(info);
+    });
+    return unsub;
+  }, []);
+  const [isDraggingLogo, setIsDraggingLogo] = useState(false);
+  const [isBackingUp, setIsBackingUp] = useState(false);
+  const [lastBackupInfo, setLastBackupInfo] = useState<{ time: string; count: number; filename: string } | null>(() => {
+    try {
+      const rawTs = localStorage.getItem('pos_last_backup_timestamp');
+      const filename = localStorage.getItem('pos_last_backup_filename') || '';
+      const count = Number(localStorage.getItem('pos_last_backup_doc_count') || 0);
+      if (rawTs) {
+        return {
+          time: new Date(Number(rawTs)).toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' }),
+          count,
+          filename
+        };
+      }
+    } catch (e) {}
+    return null;
+  });
 
   useEffect(() => {
     if (initialSettings) {
-      setFormData({
+      const activeLogo = initialSettings.logoUrl?.trim() ? initialSettings.logoUrl : DEFAULT_RESTAURANT_LOGO;
+      const activeMonochromeLogo = initialSettings.monochromeLogoUrl || initialSettings.bwLogoUrl || '';
+
+      setFormData((prev) => ({
+        ...prev,
         ...initialSettings,
-        restaurantName: initialSettings.restaurantName || 'SRI SARAVANA BHAVAN',
-        phone: initialSettings.phone || '+91 78100 66035 / 99769 74098',
-        email: initialSettings.email || 'srisaravanabhavan57.com',
-        logoUrl: initialSettings.logoUrl || DEFAULT_RESTAURANT_LOGO,
-        autoPrintOnSave: initialSettings.autoPrintOnSave !== undefined ? initialSettings.autoPrintOnSave : true,
-        receiptFontSize: initialSettings.receiptFontSize !== undefined ? initialSettings.receiptFontSize : (initialSettings.paperWidth === '58mm' ? 10 : 12)
-      });
-      if (initialSettings.logoUrl) {
-        setCustomUrlInput(initialSettings.logoUrl);
-      }
+        restaurantName: initialSettings.restaurantName || prev.restaurantName || 'SRI SARAVANA BHAVAN',
+        restaurantNameTamil: initialSettings.restaurantNameTamil !== undefined ? initialSettings.restaurantNameTamil : (prev.restaurantNameTamil || 'ஸ்ரீ சரவண பவன்'),
+        address: initialSettings.address || prev.address || 'No:8A, Rajambal Nagar, Salem Main Rd, Anna Nagar, Kallakurichi-606213',
+        phone: initialSettings.phone || prev.phone || '7708159933',
+        email: initialSettings.email !== undefined ? initialSettings.email : (prev.email || ''),
+        gstNumber: initialSettings.gstNumber !== undefined ? initialSettings.gstNumber : (prev.gstNumber || ''),
+        fssaiNumber: initialSettings.fssaiNumber !== undefined ? initialSettings.fssaiNumber : (prev.fssaiNumber || ''),
+        logoUrl: activeLogo,
+        monochromeLogoUrl: activeMonochromeLogo,
+        receiptHeader: initialSettings.receiptHeader || prev.receiptHeader || 'SRI SARAVANA BHAVAN',
+        receiptFooter: initialSettings.receiptFooter || prev.receiptFooter || '*** THANK YOU VISIT AGAIN ***',
+        businessDayStartHour: initialSettings.businessDayStartHour || prev.businessDayStartHour || '04:00',
+        billNumberDigits: initialSettings.billNumberDigits || prev.billNumberDigits || 2,
+        paperWidth: initialSettings.paperWidth || prev.paperWidth || '80mm',
+        receiptFontSize: initialSettings.receiptFontSize !== undefined ? initialSettings.receiptFontSize : (prev.receiptFontSize || 11),
+        receiptAlignment: initialSettings.receiptAlignment || prev.receiptAlignment || 'center',
+        receiptLogoMaxWidth: initialSettings.receiptLogoMaxWidth || prev.receiptLogoMaxWidth || 85,
+        receiptLogoMaxHeight: initialSettings.receiptLogoMaxHeight || prev.receiptLogoMaxHeight || 85,
+        logoDisplay: initialSettings.logoDisplay || prev.logoDisplay || 'both',
+        watermarkOpacity: initialSettings.watermarkOpacity !== undefined ? initialSettings.watermarkOpacity : (prev.watermarkOpacity !== undefined ? prev.watermarkOpacity : 0.12),
+        compactMode: initialSettings.compactMode !== undefined ? Boolean(initialSettings.compactMode) : true,
+        autoPrintOnSave: initialSettings.autoPrintOnSave !== undefined ? initialSettings.autoPrintOnSave : (prev.autoPrintOnSave !== undefined ? prev.autoPrintOnSave : true),
+        skipPrintPreview: initialSettings.skipPrintPreview !== undefined ? initialSettings.skipPrintPreview : (prev.skipPrintPreview !== undefined ? prev.skipPrintPreview : false)
+      }));
     }
   }, [initialSettings]);
 
-  /**
-   * Process & downscale uploaded image on the client side into high-contrast thermal-ready PNG
-   */
-  const handleFileProcess = async (file: File) => {
+  // Handle image upload and base64 conversion
+  const handleLogoFileUpload = (file: File) => {
     if (!file.type.startsWith('image/')) {
-      setNotification({ type: 'error', message: 'Please upload an image file (PNG, JPG, SVG, WebP).' });
+      setNotification({ type: 'error', message: 'Please select an image file (PNG, JPG, SVG, WebP).' });
+      setTimeout(() => setNotification(null), 3000);
       return;
     }
 
-    if (file.size > 5 * 1024 * 1024) {
-      setNotification({ type: 'error', message: 'Image file size should be under 5MB.' });
-      return;
-    }
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const result = e.target?.result as string;
+      if (result) {
+        setFormData((prev) => ({ ...prev, logoUrl: result }));
+        setNotification({ type: 'success', message: 'Shop logo loaded! Click Save Settings to persist.' });
+        setTimeout(() => setNotification(null), 3000);
+      }
+    };
+    reader.readAsDataURL(file);
+  };
 
-    setProcessingImage(true);
+  const handleTriggerTestPrint = () => {
+    setIsTestingPrint(true);
     try {
-      const reader = new FileReader();
-      reader.onload = (e) => {
-        const rawResult = e.target?.result as string;
-        
-        // For SVG files, directly use the data URL
-        if (file.type === 'image/svg+xml') {
-          setFormData((prev) => ({ ...prev, logoUrl: rawResult }));
-          setCustomUrlInput(rawResult);
-          setProcessingImage(false);
-          setNotification({ type: 'success', message: 'SVG vector logo uploaded and applied!' });
-          setTimeout(() => setNotification(null), 3000);
-          return;
-        }
-
-        const img = new Image();
-        img.onload = () => {
-          const canvas = document.createElement('canvas');
-          const maxW = 320;
-          const maxH = 140;
-          let { width, height } = img;
-
-          if (width > maxW || height > maxH) {
-            const ratio = Math.min(maxW / width, maxH / height);
-            width = Math.round(width * ratio);
-            height = Math.round(height * ratio);
-          }
-
-          canvas.width = width;
-          canvas.height = height;
-          const ctx = canvas.getContext('2d');
-          if (ctx) {
-            ctx.fillStyle = '#FFFFFF';
-            ctx.fillRect(0, 0, width, height);
-            ctx.drawImage(img, 0, 0, width, height);
-            const optimizedBase64 = canvas.toDataURL('image/png', 0.92);
-            setFormData((prev) => ({ ...prev, logoUrl: optimizedBase64 }));
-            setCustomUrlInput(optimizedBase64);
-            setNotification({ type: 'success', message: 'Logo optimized for thermal receipt output!' });
-            setTimeout(() => setNotification(null), 3000);
-          }
-          setProcessingImage(false);
-        };
-        img.onerror = () => {
-          setProcessingImage(false);
-          setNotification({ type: 'error', message: 'Failed to process image file.' });
-        };
-        img.src = rawResult;
-      };
-      reader.onerror = () => {
-        setProcessingImage(false);
-        setNotification({ type: 'error', message: 'Failed to read file.' });
-      };
-      reader.readAsDataURL(file);
-    } catch (err) {
-      setProcessingImage(false);
-      setNotification({ type: 'error', message: 'Error processing image.' });
+      const result = PrinterService.printDiagnosticTestPage(formData, true);
+      if (result.success && !result.restrictedInIframe) {
+        setNotification({
+          type: 'success',
+          message: 'Standardized diagnostic string sent to default thermal printer! Connection and paper feed status verified.'
+        });
+        setTimeout(() => setNotification(null), 4500);
+      } else if (result.restrictedInIframe) {
+        setShowTestPrintModal(true);
+        setNotification({
+          type: 'success',
+          message: 'Standardized diagnostic string loaded in preview. Direct system print available in preview dialog.'
+        });
+        setTimeout(() => setNotification(null), 4500);
+      } else {
+        setNotification({
+          type: 'error',
+          message: result.error || 'Failed to dispatch standardized diagnostic test page to printer.'
+        });
+        setTimeout(() => setNotification(null), 5000);
+      }
+    } catch (err: any) {
+      setNotification({
+        type: 'error',
+        message: err?.message || 'Could not execute test print sequence.'
+      });
+      setTimeout(() => setNotification(null), 5000);
+    } finally {
+      setIsTestingPrint(false);
     }
   };
 
-  const handleDrop = (e: React.DragEvent) => {
-    e.preventDefault();
-    setDragOver(false);
-    if (e.dataTransfer.files && e.dataTransfer.files[0]) {
-      handleFileProcess(e.dataTransfer.files[0]);
+  // Dispatch sample bill print to test thermal receipt layout immediately
+  const handlePrintSampleReceipt = () => {
+    const sampleBill: Bill = {
+      id: 'sample-01',
+      billNumber: '01',
+      businessDate: new Date().toISOString().split('T')[0],
+      orderType: 'DINE_IN',
+      priceType: 'NON_AC',
+      tableNumber: 'T-09',
+      subtotal: 150,
+      discount: 0,
+      grandTotal: 150,
+      paymentMethod: 'CASH',
+      paymentStatus: 'PAID',
+      status: 'COMPLETED',
+      reprintCount: 0,
+      userId: 'staff_1',
+      userName: 'sivan',
+      createdAt: Date.now(),
+      updatedAt: Date.now()
+    };
+
+    const sampleItems: BillItem[] = [
+      {
+        id: 'bi-1',
+        billId: 'sample-01',
+        itemId: 'm-1',
+        itemCode: '101',
+        itemName: 'Masala Dosa',
+        itemNameTamil: 'மசால் தோசை',
+        quantity: 1,
+        unitPrice: 80,
+        totalPrice: 80,
+        priceType: 'NON_AC',
+        createdAt: Date.now()
+      },
+      {
+        id: 'bi-2',
+        billId: 'sample-01',
+        itemId: 'm-2',
+        itemCode: '102',
+        itemName: 'Filter Coffee',
+        itemNameTamil: 'ஃபில்டர் காபி',
+        quantity: 2,
+        unitPrice: 35,
+        totalPrice: 70,
+        priceType: 'NON_AC',
+        createdAt: Date.now()
+      }
+    ];
+
+    setIsPrintingSample(true);
+    try {
+      PrinterService.printBill(sampleBill, sampleItems, formData, true);
+    } finally {
+      setTimeout(() => {
+        setIsPrintingSample(false);
+      }, 2600);
     }
   };
 
-  const handleApplyUrl = () => {
-    if (!customUrlInput.trim()) {
-      setNotification({ type: 'error', message: 'Please enter a valid image URL.' });
-      return;
-    }
-    setFormData((prev) => ({ ...prev, logoUrl: customUrlInput.trim() }));
-    setNotification({ type: 'success', message: 'Custom Logo URL applied!' });
-    setTimeout(() => setNotification(null), 3000);
-  };
-
-  const handleSelectPreset = (dataUrl: string) => {
-    setFormData((prev) => ({ ...prev, logoUrl: dataUrl }));
-    setCustomUrlInput(dataUrl);
-    setNotification({ type: 'success', message: 'Preset restaurant logo selected!' });
-    setTimeout(() => setNotification(null), 3000);
-  };
-
-  const handleClearLogo = () => {
-    setFormData((prev) => ({ ...prev, logoUrl: '' }));
-    setCustomUrlInput('');
-    if (fileInputRef.current) fileInputRef.current.value = '';
-    setNotification({ type: 'success', message: 'Logo removed from thermal receipts.' });
-    setTimeout(() => setNotification(null), 3000);
-  };
-
-  const handleSave = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const handleSave = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
     setSaving(true);
     try {
       const dataToSave = {
         ...formData,
+        logoStoragePath: formData.logoStoragePath || OFFICIAL_LOGO_STORAGE_PATH,
+        logoStorageUrl: formData.logoStorageUrl || OFFICIAL_LOGO_STORAGE_URL,
+        logoUrl: formData.logoUrl?.trim() || OFFICIAL_LOGO_PUBLIC_URL,
+        logoProtectedBrandAsset: true,
+        receiptAlignment: 'center', // Strict top-center logo placement
         updatedAt: Date.now()
       };
       await setDoc(doc(db, 'settings', 'restaurant'), dataToSave);
       if (onRefreshSettings) onRefreshSettings();
-      setNotification({ type: 'success', message: 'Restaurant settings and thermal logo saved successfully!' });
+      setNotification({ type: 'success', message: 'Restaurant settings and thermal receipt layout saved successfully!' });
       setTimeout(() => setNotification(null), 3000);
-    } catch (e: any) {
+    } catch (err: any) {
       setNotification({ type: 'error', message: 'Failed to save settings.' });
     } finally {
       setSaving(false);
@@ -252,674 +368,741 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ settings: initialSet
     }
   };
 
+  const handleDownloadBackup = async () => {
+    setIsBackingUp(true);
+    try {
+      const result = await downloadCoreBillingBackup(formData);
+      if (result.success) {
+        const formattedTime = new Date().toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' });
+        setLastBackupInfo({
+          time: formattedTime,
+          count: result.totalDocuments,
+          filename: result.filename
+        });
+        setNotification({
+          type: 'success',
+          message: `Core billing archive downloaded: ${result.billCount} bills (₹${result.totalRevenue.toLocaleString('en-IN')}) exported to "${result.filename}"`
+        });
+        setTimeout(() => setNotification(null), 6000);
+      } else {
+        setNotification({
+          type: 'error',
+          message: result.error || 'Failed to export billing archive.'
+        });
+        setTimeout(() => setNotification(null), 5000);
+      }
+    } catch (err: any) {
+      console.error('Database backup error:', err);
+      setNotification({
+        type: 'error',
+        message: err?.message || 'Error occurred while generating billing backup.'
+      });
+      setTimeout(() => setNotification(null), 5000);
+    } finally {
+      setIsBackingUp(false);
+    }
+  };
+
+  // Helper address line splitting
+  const formatAddressLines = (addr: string): string[] => {
+    if (!addr) return [];
+    if (addr.includes('\n')) return addr.split('\n').map(s => s.trim()).filter(Boolean);
+    if (addr.includes('Anna Nagar')) {
+      const parts = addr.split('Anna Nagar');
+      return [
+        parts[0].replace(/,\s*$/, '').trim(),
+        ('Anna Nagar' + parts[1]).trim()
+      ];
+    }
+    const parts = addr.split(',').map(s => s.trim()).filter(Boolean);
+    if (parts.length > 2) {
+      const mid = Math.ceil(parts.length / 2);
+      return [parts.slice(0, mid).join(', '), parts.slice(mid).join(', ')];
+    }
+    return [addr];
+  };
+
+  const addressLines = formatAddressLines(formData.address);
+  const activeLogo = formData.logoUrl?.trim() ? formData.logoUrl : DEFAULT_RESTAURANT_LOGO;
+  const is58mm = formData.paperWidth === '58mm';
+  const isCompact = Boolean(formData.compactMode);
+  const configuredFontSize = formData.receiptFontSize ? Number(formData.receiptFontSize) : (is58mm ? 10 : 11);
+  const previewBaseFontSize = isCompact ? Math.max(9, Math.round(configuredFontSize * 0.90 * 10) / 10) : configuredFontSize;
+
   return (
-    <div className="flex flex-col h-full bg-slate-950 text-slate-100 p-3 sm:p-4 gap-4 overflow-y-auto">
+    <div className="flex flex-col h-full bg-slate-950 text-slate-100 p-3 sm:p-5 gap-4 overflow-y-auto">
       
-      {/* Header */}
-      <div className="bg-slate-900 border border-slate-800 p-4 rounded-xl flex items-center justify-between shadow-md">
-        <div className="flex items-center gap-3">
-          <Settings className="w-6 h-6 text-amber-400" />
-          <div>
-            <h2 className="font-bold text-sm sm:text-base tracking-wide text-slate-100">
-              Restaurant Configuration & Thermal Logo Settings
-            </h2>
-            <p className="text-xs text-slate-400">Configure restaurant profile, upload thermal receipt logos, and customize print styles</p>
+      {/* 1. Header Bar */}
+      <div className="bg-slate-900 border border-slate-800 p-4 sm:p-5 rounded-2xl flex flex-wrap items-center justify-between gap-4 shadow-lg">
+        <div className="flex items-center gap-3.5">
+          <div className="p-2.5 bg-amber-500/10 border border-amber-500/20 rounded-xl text-amber-400">
+            <Settings className="w-6 h-6" />
           </div>
+          <div>
+            <div className="flex items-center gap-2 flex-wrap">
+              <h2 className="font-bold text-base sm:text-lg tracking-wide text-white">
+                Store Settings & Thermal Receipt
+              </h2>
+              {isCompact && (
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-semibold bg-emerald-500/15 text-emerald-400 border border-emerald-500/30">
+                  <Leaf className="w-3 h-3" />
+                  Paper Saver Active
+                </span>
+              )}
+              <span className="px-2 py-0.5 rounded-full text-[11px] font-mono bg-slate-800 text-slate-300 border border-slate-700">
+                {formData.paperWidth || '80mm'}
+              </span>
+            </div>
+            <p className="text-xs text-slate-400 mt-0.5">
+              Configure hotel identity, watermark logo in light background, paper-saving thermal format & printer calibration
+            </p>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-2.5 ml-auto">
+          <button
+            type="button"
+            onClick={handleDownloadBackup}
+            disabled={isBackingUp}
+            id="download-db-backup-header-btn"
+            className="px-3.5 py-2 text-xs sm:text-sm font-semibold text-slate-300 hover:text-white bg-slate-800 hover:bg-slate-700 active:bg-slate-850 border border-slate-700 rounded-xl transition-all flex items-center gap-1.5 cursor-pointer shadow-xs disabled:opacity-50"
+            title="Export Firestore collections to a JSON file for local record-keeping"
+          >
+            <Download className={`w-4 h-4 text-emerald-400 ${isBackingUp ? 'animate-bounce' : ''}`} />
+            <span>{isBackingUp ? 'Exporting...' : 'Download Database Backup'}</span>
+          </button>
+
+          <button
+            type="button"
+            id="btn-print-test-page"
+            onClick={handleTriggerTestPrint}
+            disabled={isTestingPrint}
+            className="px-3.5 py-2 text-xs sm:text-sm font-bold text-amber-300 hover:text-amber-200 bg-amber-950/40 hover:bg-amber-900/50 active:bg-amber-950/70 border border-amber-500/40 rounded-xl transition-all flex items-center gap-1.5 cursor-pointer shadow-xs hover:border-amber-400 disabled:opacity-50"
+            title="Send standardized diagnostic string to default thermal printer to verify connection and paper feed status immediately"
+          >
+            <Printer className={`w-4 h-4 text-amber-400 ${isTestingPrint ? 'animate-pulse' : ''}`} />
+            <span>{isTestingPrint ? 'Printing Test Page...' : 'Print Test Page'}</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => handleSave()}
+            disabled={saving}
+            className="px-4 py-2 text-xs sm:text-sm font-bold text-white bg-emerald-600 hover:bg-emerald-500 active:bg-emerald-700 rounded-xl transition-all flex items-center gap-2 cursor-pointer shadow-md shadow-emerald-900/30 disabled:opacity-50"
+          >
+            <Save className={`w-4 h-4 ${saving ? 'animate-spin' : ''}`} />
+            <span>{saving ? 'Saving...' : 'Save Settings'}</span>
+          </button>
         </div>
       </div>
 
       {/* Notifications */}
       {notification && (
-        <div className={`px-4 py-2.5 rounded-lg text-xs flex items-center gap-2 transition-all ${
+        <div className={`px-4 py-3 rounded-xl text-xs sm:text-sm font-medium flex items-center gap-2.5 transition-all shadow-md ${
           notification.type === 'success'
-            ? 'bg-emerald-950 border border-emerald-500/40 text-emerald-300'
-            : 'bg-red-950 border border-red-500/40 text-red-300'
+            ? 'bg-emerald-950/90 border border-emerald-500/40 text-emerald-200'
+            : 'bg-red-950/90 border border-red-500/40 text-red-200'
         }`}>
-          {notification.type === 'success' ? <CheckCircle className="w-4 h-4 shrink-0" /> : <AlertCircle className="w-4 h-4 shrink-0" />}
+          {notification.type === 'success' ? (
+            <CheckCircle className="w-5 h-5 text-emerald-400 shrink-0" />
+          ) : (
+            <AlertCircle className="w-5 h-5 text-red-400 shrink-0" />
+          )}
           <span>{notification.message}</span>
         </div>
       )}
 
-      {/* Form & Live Preview Grid */}
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
+      {/* 2. Main Workspace (Config Tabs on Left, Live Compact Receipt on Right) */}
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 items-start">
         
-        {/* Main Settings Form (8 cols) */}
-        <form onSubmit={handleSave} className="lg:col-span-8 bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-md space-y-5 text-xs">
+        {/* Left Column: Form & Tabbed Configuration (7 cols) */}
+        <div className="lg:col-span-7 flex flex-col gap-4">
           
-          <div className="font-bold text-sm text-slate-200 border-b border-slate-800 pb-2 flex items-center justify-between">
-            <div className="flex items-center gap-2">
-              <Store className="w-4 h-4 text-amber-400" />
-              <span>Store Profile & Identity</span>
-            </div>
-            <span className="text-[11px] text-amber-400 font-normal">Thermal Print Pipeline Config</span>
-          </div>
-
-          <div>
-            <label className="block font-bold text-slate-400 mb-1">RESTAURANT NAME *</label>
-            <input
-              type="text"
-              required
-              value={formData.restaurantName}
-              onChange={(e) => setFormData({ ...formData, restaurantName: e.target.value })}
-              className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white font-bold focus:outline-none focus:border-amber-400"
-            />
-          </div>
-
-          <div>
-            <label className="block font-bold text-slate-400 mb-1">STORE ADDRESS</label>
-            <input
-              type="text"
-              value={formData.address}
-              onChange={(e) => setFormData({ ...formData, address: e.target.value })}
-              className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white focus:outline-none focus:border-amber-400"
-            />
-          </div>
-
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-            <div>
-              <label className="block font-bold text-slate-400 mb-1">CONTACT PHONE</label>
-              <input
-                type="text"
-                value={formData.phone}
-                onChange={(e) => setFormData({ ...formData, phone: e.target.value })}
-                className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white focus:outline-none focus:border-amber-400"
-              />
-            </div>
-
-            <div>
-              <label className="block font-bold text-slate-400 mb-1">BUSINESS EMAIL (OPTIONAL)</label>
-              <input
-                type="email"
-                placeholder="contact@restaurant.com"
-                value={formData.email || ''}
-                onChange={(e) => setFormData({ ...formData, email: e.target.value })}
-                className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white focus:outline-none focus:border-amber-400"
-              />
-            </div>
-
-            <div>
-              <label className="block font-bold text-slate-400 mb-1">GSTIN / FSSAI (OPTIONAL)</label>
-              <input
-                type="text"
-                placeholder="GSTIN / FSSAI Lic No."
-                value={formData.gstNumber || ''}
-                onChange={(e) => setFormData({ ...formData, gstNumber: e.target.value })}
-                className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white focus:outline-none focus:border-amber-400"
-              />
-            </div>
-          </div>
-
-          {/* ========================================================================= */}
-          {/* THERMAL RECEIPT RESTAURANT LOGO UPLOAD & CONFIGURATION MODULE */}
-          {/* ========================================================================= */}
-          <div className="bg-slate-950 border border-slate-800 rounded-xl p-4 space-y-3.5">
-            <div className="flex items-center justify-between border-b border-slate-800 pb-2.5">
-              <div className="flex items-center gap-2">
-                <ImageIcon className="w-4 h-4 text-amber-400" />
-                <span className="font-bold text-slate-200 text-xs sm:text-sm">Thermal Receipt Logo Configuration</span>
-              </div>
-              {formData.logoUrl && (
-                <button
-                  type="button"
-                  onClick={handleClearLogo}
-                  className="flex items-center gap-1 text-[11px] text-red-400 hover:text-red-300 px-2 py-1 bg-red-950/50 hover:bg-red-950 border border-red-800/60 rounded-md cursor-pointer transition-colors"
-                >
-                  <Trash2 className="w-3 h-3" />
-                  <span>Remove Logo</span>
-                </button>
-              )}
-            </div>
-
-            <p className="text-[11px] text-slate-400 leading-relaxed">
-              Upload your restaurant logo to be displayed prominently at the top of all printed thermal receipts and in the print-ready container.
-            </p>
-
-            {/* Logo Selection Tabs */}
-            <div className="flex items-center gap-1 bg-slate-900 p-1 rounded-lg border border-slate-800 w-fit">
-              <button
-                type="button"
-                onClick={() => setLogoInputTab('upload')}
-                className={`px-3 py-1 rounded text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer ${
-                  logoInputTab === 'upload' ? 'bg-amber-500 text-slate-950 font-bold' : 'text-slate-400 hover:text-white'
-                }`}
-              >
-                <Upload className="w-3.5 h-3.5" />
-                <span>Upload File</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => setLogoInputTab('presets')}
-                className={`px-3 py-1 rounded text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer ${
-                  logoInputTab === 'presets' ? 'bg-amber-500 text-slate-950 font-bold' : 'text-slate-400 hover:text-white'
-                }`}
-              >
-                <Sparkles className="w-3.5 h-3.5" />
-                <span>Sample Emblems</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => setLogoInputTab('url')}
-                className={`px-3 py-1 rounded text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer ${
-                  logoInputTab === 'url' ? 'bg-amber-500 text-slate-950 font-bold' : 'text-slate-400 hover:text-white'
-                }`}
-              >
-                <Link className="w-3.5 h-3.5" />
-                <span>Direct URL</span>
-              </button>
-            </div>
-
-            {/* Tab 1: Upload File with Drag & Drop */}
-            {logoInputTab === 'upload' && (
-              <div 
-                onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
-                onDragLeave={() => setDragOver(false)}
-                onDrop={handleDrop}
-                onClick={() => fileInputRef.current?.click()}
-                className={`border-2 border-dashed rounded-xl p-5 text-center cursor-pointer transition-all ${
-                  dragOver 
-                    ? 'border-amber-400 bg-amber-500/10' 
-                    : 'border-slate-700 bg-slate-900/50 hover:border-slate-500 hover:bg-slate-900'
-                }`}
-              >
-                <input 
-                  type="file" 
-                  ref={fileInputRef} 
-                  onChange={(e) => e.target.files?.[0] && handleFileProcess(e.target.files[0])}
-                  accept="image/png,image/jpeg,image/svg+xml,image/webp" 
-                  className="hidden" 
-                />
-                <div className="flex flex-col items-center justify-center gap-2">
-                  <div className="w-10 h-10 rounded-full bg-amber-500/20 text-amber-400 flex items-center justify-center">
-                    <Upload className={`w-5 h-5 ${processingImage ? 'animate-bounce' : ''}`} />
-                  </div>
-                  <div>
-                    <span className="font-bold text-slate-200 block text-xs sm:text-sm">
-                      {processingImage ? 'Optimizing Image for Thermal Heads...' : 'Click to Browse or Drag & Drop Restaurant Logo'}
-                    </span>
-                    <span className="text-[11px] text-slate-500 mt-0.5 block">
-                      PNG, JPG, SVG, WebP supported • Auto-optimized for 80mm & 58mm receipts
-                    </span>
-                  </div>
-                </div>
-              </div>
-            )}
-
-            {/* Tab 2: Sample Emblems */}
-            {logoInputTab === 'presets' && (
-              <div className="space-y-2">
-                <span className="text-[11px] text-slate-400 block">Choose a high-contrast emblem optimized for thermal printers:</span>
-                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
-                  {SAMPLE_PRESET_LOGOS.map((preset) => {
-                    const IconComp = preset.icon;
-                    const isSelected = formData.logoUrl === preset.dataUrl;
-                    return (
-                      <button
-                        key={preset.id}
-                        type="button"
-                        onClick={() => handleSelectPreset(preset.dataUrl)}
-                        className={`p-3 rounded-lg border flex flex-col items-center gap-2 text-center transition-all cursor-pointer ${
-                          isSelected 
-                            ? 'bg-amber-500/20 border-amber-400 text-amber-300 ring-1 ring-amber-400' 
-                            : 'bg-slate-900 border-slate-800 text-slate-300 hover:border-slate-700 hover:bg-slate-850'
-                        }`}
-                      >
-                        <div className="w-full bg-white rounded p-1.5 flex items-center justify-center h-12">
-                          <img src={preset.dataUrl} alt={preset.name} className="max-h-10 max-w-full object-contain" />
-                        </div>
-                        <span className="font-bold text-[11px]">{preset.name}</span>
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-            )}
-
-            {/* Tab 3: Direct URL */}
-            {logoInputTab === 'url' && (
-              <div className="space-y-2">
-                <div className="flex gap-2">
-                  <input
-                    type="url"
-                    placeholder="https://example.com/restaurant-logo.png"
-                    value={customUrlInput}
-                    onChange={(e) => setCustomUrlInput(e.target.value)}
-                    className="flex-1 bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-white font-mono text-xs focus:outline-none focus:border-amber-400"
-                  />
-                  <button
-                    type="button"
-                    onClick={handleApplyUrl}
-                    className="px-4 py-2 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold rounded-lg cursor-pointer transition-colors"
-                  >
-                    Apply URL
-                  </button>
-                </div>
-                <span className="text-[10px] text-slate-500">Provide an HTTPS URL to a publicly accessible logo image</span>
-              </div>
-            )}
-
-            {/* Active Logo Status Banner */}
-            {formData.logoUrl ? (
-              <div className="flex items-center gap-3 bg-slate-900 border border-slate-800 rounded-lg p-2.5">
-                <div className="w-16 h-12 bg-white rounded flex items-center justify-center p-1 border border-slate-700 shrink-0">
-                  <img 
-                    src={formData.logoUrl} 
-                    alt="Active Logo" 
-                    className="max-h-10 max-w-full object-contain filter grayscale contrast-125" 
-                    referrerPolicy="no-referrer"
-                  />
-                </div>
-                <div className="flex-1 min-w-0">
-                  <div className="flex items-center gap-1.5">
-                    <CheckCircle className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-                    <span className="font-bold text-emerald-400 text-xs">Active Logo Configured</span>
-                  </div>
-                  <p className="text-[10px] text-slate-400 truncate mt-0.5">
-                    Logo is ready to print at the header of all receipts.
-                  </p>
-                </div>
-              </div>
-            ) : (
-              <div className="text-[11px] text-slate-500 italic bg-slate-900/40 p-2 rounded border border-slate-800/60 text-center">
-                No custom logo set. Default text-only header will be printed.
-              </div>
-            )}
-          </div>
-
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-            <div>
-              <label className="block font-bold text-slate-400 mb-1">RECEIPT HEADER SLOGAN</label>
-              <input
-                type="text"
-                value={formData.receiptHeader}
-                onChange={(e) => setFormData({ ...formData, receiptHeader: e.target.value })}
-                className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white focus:outline-none focus:border-amber-400"
-              />
-            </div>
-
-            <div>
-              <label className="block font-bold text-slate-400 mb-1">RECEIPT FOOTER MESSAGE</label>
-              <input
-                type="text"
-                value={formData.receiptFooter}
-                onChange={(e) => setFormData({ ...formData, receiptFooter: e.target.value })}
-                className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white focus:outline-none focus:border-amber-400"
-              />
-            </div>
-          </div>
-
-          <div className="font-bold text-sm text-slate-200 border-b border-slate-800 pb-2 pt-3 flex items-center gap-2">
-            <Clock className="w-4 h-4 text-blue-400" />
-            <span>Business Operational Hours & Paper Dimensions</span>
-          </div>
-
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-            <div>
-              <label className="block font-bold text-slate-400 mb-1">BUSINESS DAY START (HH:MM)</label>
-              <input
-                type="text"
-                value={formData.businessDayStartHour}
-                onChange={(e) => setFormData({ ...formData, businessDayStartHour: e.target.value })}
-                placeholder="04:00"
-                className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white font-mono focus:outline-none focus:border-amber-400"
-              />
-              <span className="text-[10px] text-slate-500 mt-0.5 block">Default 04:00 AM reset</span>
-            </div>
-
-            <div>
-              <label className="block font-bold text-slate-400 mb-1">BILL NUMBER DIGITS</label>
-              <select
-                value={formData.billNumberDigits}
-                onChange={(e) => setFormData({ ...formData, billNumberDigits: parseInt(e.target.value, 10) })}
-                className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white font-mono focus:outline-none focus:border-amber-400"
-              >
-                <option value={2}>2 Digits (01, 02... 99)</option>
-                <option value={3}>3 Digits (001, 002... 999)</option>
-                <option value={4}>4 Digits (0001, 0002...)</option>
-              </select>
-            </div>
-
-            <div>
-              <label className="block font-bold text-slate-400 mb-1">THERMAL PAPER WIDTH</label>
-              <select
-                value={formData.paperWidth}
-                onChange={(e) => setFormData({ ...formData, paperWidth: e.target.value as any })}
-                className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white font-mono focus:outline-none focus:border-amber-400"
-              >
-                <option value="80mm">80mm (Standard POS / 3 inch)</option>
-                <option value="58mm">58mm (Compact / 2 inch)</option>
-              </select>
-            </div>
-          </div>
-
-          <div className="font-bold text-sm text-slate-200 border-b border-slate-800 pb-2 pt-3 flex items-center gap-2">
-            <Receipt className="w-4 h-4 text-emerald-400" />
-            <span>Billing & Print Automation</span>
-          </div>
-
-          {/* Auto-Print on Save Checkbox Configuration */}
-          <div 
-            id="billing-auto-print-setting-card"
-            className={`border rounded-xl p-4 space-y-2.5 transition-all ${
-              formData.autoPrintOnSave !== false
-                ? 'bg-emerald-950/20 border-emerald-500/40'
-                : 'bg-slate-950/60 border-slate-800'
-            }`}
-          >
-            <div className="flex items-start justify-between gap-3">
-              <label 
-                htmlFor="auto-print-on-save-checkbox"
-                className="flex items-start gap-3 cursor-pointer flex-1"
-              >
-                <input
-                  id="auto-print-on-save-checkbox"
-                  type="checkbox"
-                  checked={formData.autoPrintOnSave !== false}
-                  onChange={(e) => {
-                    const isChecked = e.target.checked;
-                    setFormData((prev) => ({ ...prev, autoPrintOnSave: isChecked }));
-                  }}
-                  className="w-5 h-5 rounded border-slate-700 bg-slate-900 text-emerald-500 focus:ring-emerald-400 focus:ring-offset-slate-900 mt-0.5 cursor-pointer shrink-0"
-                />
-                <div>
-                  <div className="flex items-center gap-2 flex-wrap">
-                    <span className="font-bold text-slate-100 text-xs sm:text-sm">
-                      Enable 'Auto-Print on Save'
-                    </span>
-                    <span className={`text-[10px] font-mono px-2 py-0.5 rounded-full font-bold ${
-                      formData.autoPrintOnSave !== false
-                        ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
-                        : 'bg-slate-800 text-slate-400 border border-slate-700'
-                    }`}>
-                      {formData.autoPrintOnSave !== false ? '● ACTIVE: AUTO-PRINT ON SAVE' : '○ DISABLED: SAVE ONLY'}
-                    </span>
-                  </div>
-                  <p className="text-xs text-slate-400 leading-relaxed mt-1">
-                    Triggers the browser print dialog immediately after a bill is successfully saved to Firestore.
-                  </p>
-                </div>
-              </label>
-            </div>
-
-            <div className="text-[11px] text-slate-500 pl-8 pt-1 border-t border-slate-800/80">
-              {formData.autoPrintOnSave !== false ? (
-                <span className="text-emerald-400/90 font-medium">
-                  ✓ High-speed cashier workflow: Saving a bill writes to Firestore and opens the thermal print dialog instantly.
-                </span>
-              ) : (
-                <span className="text-slate-400">
-                  Bills will be saved securely to Firestore without popping the print dialog. Cashiers can view or reprint receipts on demand.
-                </span>
-              )}
-            </div>
-          </div>
-
-          {/* Receipt Base Font Size Slider */}
-          <div 
-            id="receipt-font-size-setting-card"
-            className="border border-slate-800 bg-slate-950/70 rounded-xl p-4 space-y-3 transition-all"
-          >
-            <div className="flex items-center justify-between flex-wrap gap-2">
-              <div className="flex items-center gap-2">
-                <Type className="w-4 h-4 text-amber-400" />
-                <label htmlFor="receipt-font-size-slider" className="font-bold text-slate-200 text-xs sm:text-sm">
-                  RECEIPT BASE FONT SIZE
-                </label>
-              </div>
-              <div className="flex items-center gap-2">
-                <span className="text-[11px] font-mono px-2.5 py-0.5 rounded-full font-bold bg-amber-500/20 text-amber-300 border border-amber-500/30">
-                  {formData.receiptFontSize || (formData.paperWidth === '58mm' ? 10 : 12)}px
-                  {(formData.receiptFontSize || (formData.paperWidth === '58mm' ? 10 : 12)) === 12 ? ' (Standard 80mm)' : (formData.receiptFontSize || (formData.paperWidth === '58mm' ? 10 : 12)) === 10 ? ' (Standard 58mm)' : ''}
-                </span>
-              </div>
-            </div>
-
-            <div className="space-y-2.5">
-              <div className="flex items-center gap-3">
-                <span className="text-[11px] font-mono text-slate-400 shrink-0">9px (Micro)</span>
-                <input
-                  id="receipt-font-size-slider"
-                  type="range"
-                  min={9}
-                  max={18}
-                  step={1}
-                  value={formData.receiptFontSize || (formData.paperWidth === '58mm' ? 10 : 12)}
-                  onChange={(e) => {
-                    const val = parseInt(e.target.value, 10);
-                    setFormData((prev) => ({ ...prev, receiptFontSize: val }));
-                  }}
-                  className="w-full h-2 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-amber-500 focus:outline-none focus:ring-2 focus:ring-amber-400"
-                />
-                <span className="text-[11px] font-mono text-slate-400 shrink-0">18px (Large)</span>
-              </div>
-
-              {/* Quick Presets */}
-              <div className="flex items-center gap-2 pt-1 flex-wrap">
-                <span className="text-[10px] text-slate-500 font-semibold uppercase">Presets:</span>
-                {[
-                  { label: '9px (Micro)', value: 9 },
-                  { label: '10px (58mm Default)', value: 10 },
-                  { label: '12px (80mm Default)', value: 12 },
-                  { label: '14px (Medium)', value: 14 },
-                  { label: '16px (Large)', value: 16 }
-                ].map((preset) => {
-                  const currentSize = formData.receiptFontSize || (formData.paperWidth === '58mm' ? 10 : 12);
-                  const isActive = currentSize === preset.value;
-                  return (
-                    <button
-                      key={preset.value}
-                      type="button"
-                      onClick={() => setFormData((prev) => ({ ...prev, receiptFontSize: preset.value }))}
-                      className={`px-2.5 py-1 text-[11px] rounded-lg border font-mono transition-colors cursor-pointer ${
-                        isActive
-                          ? 'bg-amber-500/20 border-amber-500 text-amber-300 font-bold'
-                          : 'bg-slate-900 border-slate-700 text-slate-400 hover:text-slate-200 hover:border-slate-600'
-                      }`}
-                    >
-                      {preset.label}
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-
-            <div className="text-[11px] text-slate-400 leading-relaxed border-t border-slate-800/80 pt-2 space-y-1">
-              <p>
-                Dynamically updates the CSS variables (<code className="text-amber-400 font-mono text-[10px]">--receipt-base-font-size</code>) and layout classes in <code className="text-slate-300 font-mono text-[10px]">#pos-print-root</code>.
-              </p>
-              <p className="text-slate-500 text-[10px]">
-                Item descriptions, header tags, table rows, and grand totals scale proportionally for all thermal printer models.
-              </p>
-            </div>
-          </div>
-
-          <div className="bg-slate-950/80 border border-amber-500/30 rounded-xl p-3.5 space-y-2">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <Printer className="w-4 h-4 text-amber-400" />
-                <span className="font-bold text-slate-200">Development / Testing Mode (No Physical Printer)</span>
-              </div>
-              <label className="relative inline-flex items-center cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={localStorage.getItem('pos_printer_mock_mode') === 'true'}
-                  onChange={(e) => {
-                    localStorage.setItem('pos_printer_mock_mode', String(e.target.checked));
-                    setNotification({
-                      type: 'success',
-                      message: e.target.checked
-                        ? 'Test Print Mode Enabled: Print dialogs will be bypassed for zero-friction billing speed testing.'
-                        : 'Hardware Printer Enabled: Print dialog will open on settlement.'
-                    });
-                    setTimeout(() => setNotification(null), 3000);
-                  }}
-                  className="sr-only peer"
-                />
-                <div className="w-9 h-5 bg-slate-800 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-amber-500"></div>
-              </label>
-            </div>
-            <p className="text-[11px] text-slate-400 leading-relaxed">
-              Enable this while building and testing your billing speed without a connected receipt printer. You can still inspect receipts anytime via the <b>"View Receipt"</b> button or the <b>Reprint</b> history.
-            </p>
-          </div>
-
-          <div className="flex justify-end pt-3">
+          {/* Tabs Navigation */}
+          <div className="flex bg-slate-900 border border-slate-800 rounded-xl p-1 gap-1 overflow-x-auto text-xs font-semibold">
             <button
-              type="submit"
-              disabled={saving}
-              className="px-6 py-2.5 bg-amber-500 hover:bg-amber-400 text-slate-950 font-extrabold text-xs rounded-xl flex items-center gap-2 shadow-lg shadow-amber-500/20 cursor-pointer transition-colors"
+              type="button"
+              onClick={() => setActiveTab('store')}
+              className={`flex-1 min-w-[110px] py-2 px-3 rounded-lg flex items-center justify-center gap-2 transition-all cursor-pointer ${
+                activeTab === 'store' 
+                  ? 'bg-amber-500/20 text-amber-300 border border-amber-500/30 font-bold shadow-xs' 
+                  : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/60'
+              }`}
             >
-              <Save className="w-4 h-4" /> Save Settings
+              <Store className="w-4 h-4" />
+              <span>Hotel Profile</span>
             </button>
-          </div>
-
-        </form>
-
-        {/* Live Thermal Receipt Header Preview & Seeder (4 cols) */}
-        <div className="lg:col-span-4 space-y-4">
-          
-          {/* Live Receipt Preview Card */}
-          <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 shadow-md space-y-3">
-            <div className="flex items-center justify-between border-b border-slate-800 pb-2">
-              <div className="flex items-center gap-2">
-                <Eye className="w-4 h-4 text-amber-400" />
-                <span className="font-bold text-xs text-slate-200">Live Thermal Header Preview</span>
-              </div>
-              <span className="text-[10px] font-mono bg-slate-800 px-2 py-0.5 rounded text-amber-300">
-                {formData.paperWidth || '80mm'}
-              </span>
-            </div>
-
-            {/* Thermal Simulated Slip */}
-            {(() => {
-              const previewBase = formData.receiptFontSize || (formData.paperWidth === '58mm' ? 10 : 12);
-              const is58 = formData.paperWidth === '58mm';
-              return (
-                <div 
-                  className={`bg-white text-black p-4 rounded shadow font-mono leading-tight select-text border border-slate-300 transition-all ${is58 ? 'max-w-[240px] mx-auto' : 'w-full'}`}
-                  style={{
-                    fontSize: `${previewBase}px`,
-                    ['--receipt-base-font-size' as any]: `${previewBase}px`
-                  }}
-                >
-                  
-                  {/* Receipt Logo Output */}
-                  {formData.logoUrl && (
-                    <div className="flex justify-center items-center mb-2">
-                      <img 
-                        src={formData.logoUrl} 
-                        alt="Receipt Header Logo" 
-                        className="max-h-12 max-w-[140px] object-contain filter grayscale contrast-125"
-                        referrerPolicy="no-referrer"
-                      />
-                    </div>
-                  )}
-
-                  {/* Title & Info */}
-                  <div className="text-center">
-                    <div 
-                      style={{ fontSize: `${Math.round(previewBase * 1.25 * 10) / 10}px` }}
-                      className="font-black uppercase tracking-wide"
-                    >
-                      {formData.restaurantName || 'RESTAURANT NAME'}
-                    </div>
-                    {formData.receiptHeader && (
-                      <div 
-                        style={{ fontSize: `${Math.round(previewBase * 0.88 * 10) / 10}px` }}
-                        className="font-semibold italic mt-0.5"
-                      >
-                        ★ {formData.receiptHeader} ★
-                      </div>
-                    )}
-                    <div 
-                      style={{ fontSize: `${Math.round(previewBase * 0.85 * 10) / 10}px` }}
-                      className="mt-1 space-y-0.5 leading-tight text-slate-800"
-                    >
-                      <div>{formData.address || 'Address Line'}</div>
-                      <div>Tel: {formData.phone || 'Phone'}</div>
-                      {formData.gstNumber && <div className="font-bold mt-0.5">GSTIN: {formData.gstNumber}</div>}
-                    </div>
-                  </div>
-
-                  <div className="border-t border-dashed border-black my-2" />
-
-                  <div 
-                    style={{ fontSize: `${Math.round(previewBase * 0.85 * 10) / 10}px` }}
-                    className="text-slate-700 flex justify-between"
-                  >
-                    <span>Bill: #01</span>
-                    <span>{new Date().toLocaleDateString('en-GB')} {new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
-                  </div>
-
-                  <div className="border-t border-dashed border-black my-1.5" />
-
-                  {/* Sample item */}
-                  <div 
-                    style={{ fontSize: `${previewBase}px` }}
-                    className="flex justify-between font-bold"
-                  >
-                    <span>1× Masala Dosa</span>
-                    <span>₹80.00</span>
-                  </div>
-                  <div 
-                    style={{ fontSize: `${previewBase}px` }}
-                    className="flex justify-between font-bold"
-                  >
-                    <span>1× Filter Coffee</span>
-                    <span>₹35.00</span>
-                  </div>
-
-                  <div 
-                    style={{ fontSize: `${Math.round(previewBase * 1.25 * 10) / 10}px` }}
-                    className="border-t-2 border-double border-black my-1.5 pt-1 flex justify-between font-black"
-                  >
-                    <span>TOTAL:</span>
-                    <span>₹115.00</span>
-                  </div>
-
-                  <div className="border-t border-dashed border-black my-1.5" />
-                  
-                  <div 
-                    style={{ fontSize: `${Math.round(previewBase * 0.80 * 10) / 10}px` }}
-                    className="text-center text-slate-600"
-                  >
-                    <div>{formData.receiptFooter || 'Thank you!'}</div>
-                  </div>
-                </div>
-              );
-            })()}
-
-            <p className="text-[10px] text-slate-500 text-center">
-              Real-time rendering of thermal receipt top layout
-            </p>
-          </div>
-
-          {/* Database Seeder */}
-          <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-md space-y-3 text-xs">
-            <div className="flex items-center gap-2 font-bold text-sm text-slate-200">
-              <Database className="w-4 h-4 text-emerald-400" />
-              <span>Menu & System Seeder</span>
-            </div>
-
-            <p className="text-slate-400 leading-relaxed">
-              Populate your Firestore database with the pre-configured restaurant catalog: South Indian Tiffin, Rice, Meals, Beverages, Snacks, Default Admin and Waiter roles, and Initial Categories.
-            </p>
 
             <button
               type="button"
-              onClick={handleRunBootstrap}
-              disabled={bootstrapping}
-              className="w-full py-2.5 px-4 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white font-bold rounded-lg flex items-center justify-center gap-2 shadow-md cursor-pointer transition-colors"
+              onClick={() => setActiveTab('logo')}
+              className={`flex-1 min-w-[110px] py-2 px-3 rounded-lg flex items-center justify-center gap-2 transition-all cursor-pointer ${
+                activeTab === 'logo' 
+                  ? 'bg-amber-500/20 text-amber-300 border border-amber-500/30 font-bold shadow-xs' 
+                  : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/60'
+              }`}
             >
-              <Sparkles className={`w-4 h-4 ${bootstrapping ? 'animate-spin' : ''}`} />
-              <span>{bootstrapping ? 'Seeding Database...' : 'Seed Sample Menu & Data'}</span>
+              <ImageIcon className="w-4 h-4" />
+              <span>Logo Processor</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setActiveTab('receipt')}
+              className={`flex-1 min-w-[130px] py-2 px-3 rounded-lg flex items-center justify-center gap-2 transition-all cursor-pointer ${
+                activeTab === 'receipt' 
+                  ? 'bg-amber-500/20 text-amber-300 border border-amber-500/30 font-bold shadow-xs' 
+                  : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/60'
+              }`}
+            >
+              <Sliders className="w-4 h-4 text-amber-400" />
+              <span>Receipt Designer</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setActiveTab('hardware')}
+              className={`flex-1 min-w-[120px] py-2 px-3 rounded-lg flex items-center justify-center gap-2 transition-all cursor-pointer ${
+                activeTab === 'hardware' 
+                  ? 'bg-amber-500/20 text-amber-300 border border-amber-500/30 font-bold shadow-xs' 
+                  : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/60'
+              }`}
+            >
+              <Printer className="w-4 h-4" />
+              <span>Printer & Data</span>
+            </button>
+
+            <button
+              type="button"
+              id="tab-printer-diagnostic"
+              onClick={() => setActiveTab('diagnostic')}
+              className={`flex-1 min-w-[135px] py-2 px-3 rounded-lg flex items-center justify-center gap-2 transition-all cursor-pointer ${
+                activeTab === 'diagnostic' 
+                  ? 'bg-amber-500/20 text-amber-300 border border-amber-500/30 font-bold shadow-xs' 
+                  : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/60'
+              }`}
+            >
+              <Activity className="w-4 h-4 text-amber-400" />
+              <span>Printer Diagnostic</span>
             </button>
           </div>
 
+          {/* Tab 1: Hotel Profile */}
+          {activeTab === 'store' && (
+            <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-lg space-y-4">
+              <div className="flex items-center gap-2.5 pb-3 border-b border-slate-800">
+                <Store className="w-5 h-5 text-amber-400" />
+                <div>
+                  <h3 className="font-bold text-sm text-white">Hotel Name, Address & Contact</h3>
+                  <p className="text-xs text-slate-400">Printed directly in the receipt top header</p>
+                </div>
+              </div>
+
+              <div className="space-y-3.5">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
+                  <div>
+                    <label className="block text-xs font-bold text-slate-300 mb-1">
+                      Hotel Name (English) <span className="text-red-400">*</span>
+                    </label>
+                    <input
+                      type="text"
+                      value={formData.restaurantName}
+                      onChange={(e) => setFormData({ ...formData, restaurantName: e.target.value })}
+                      className="w-full bg-slate-950 border border-slate-700 focus:border-amber-500 focus:ring-1 focus:ring-amber-500 rounded-xl px-3.5 py-2.5 text-sm text-white font-semibold transition-colors"
+                      placeholder="e.g. SRI SARAVANA BHAVAN"
+                      required
+                    />
+                    <p className="text-[11px] text-slate-500 mt-1">Default brand name</p>
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-bold text-amber-400 mb-1">
+                      Hotel Name in Tamil (ரசீது தலைப்பு) <span className="text-red-400">*</span>
+                    </label>
+                    <input
+                      type="text"
+                      value={formData.restaurantNameTamil || ''}
+                      onChange={(e) => setFormData({ ...formData, restaurantNameTamil: e.target.value })}
+                      className="w-full bg-slate-950 border border-amber-500/50 focus:border-amber-500 focus:ring-1 focus:ring-amber-500 rounded-xl px-3.5 py-2.5 text-sm text-white font-semibold transition-colors"
+                      placeholder="e.g. ஸ்ரீ சரவண பவன்"
+                      required
+                    />
+                    <p className="text-[11px] text-amber-400/80 mt-1">Printed prominently in Tamil as header on the thermal bill</p>
+                  </div>
+                </div>
+
+                <div>
+                  <label className="block text-xs font-bold text-slate-300 mb-1">
+                    Hotel Address <span className="text-red-400">*</span>
+                  </label>
+                  <textarea
+                    value={formData.address}
+                    onChange={(e) => setFormData({ ...formData, address: e.target.value })}
+                    rows={3}
+                    className="w-full bg-slate-950 border border-slate-700 focus:border-amber-500 focus:ring-1 focus:ring-amber-500 rounded-xl px-3.5 py-2 text-xs text-white leading-relaxed transition-colors"
+                    placeholder="No:8A, Rajambal Nagar, Salem Main Rd, Anna Nagar, Kallakurichi-606213"
+                    required
+                  />
+                  <p className="text-[11px] text-slate-500 mt-1">Formatted cleanly onto concise lines for paper saving</p>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
+                  <div>
+                    <label className="block text-xs font-bold text-slate-300 mb-1">
+                      Phone Number <span className="text-red-400">*</span>
+                    </label>
+                    <input
+                      type="text"
+                      value={formData.phone}
+                      onChange={(e) => setFormData({ ...formData, phone: e.target.value })}
+                      className="w-full bg-slate-950 border border-slate-700 focus:border-amber-500 focus:ring-1 focus:ring-amber-500 rounded-xl px-3.5 py-2 text-xs text-white font-mono transition-colors"
+                      placeholder="e.g. 7708159933"
+                      required
+                    />
+                    <p className="text-[11px] text-slate-500 mt-1">Bill metadata is placed right after this phone number</p>
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-bold text-slate-300 mb-1">
+                      Email Address (Optional)
+                    </label>
+                    <input
+                      type="text"
+                      value={formData.email || ''}
+                      onChange={(e) => setFormData({ ...formData, email: e.target.value })}
+                      className="w-full bg-slate-950 border border-slate-700 focus:border-amber-500 focus:ring-1 focus:ring-amber-500 rounded-xl px-3.5 py-2 text-xs text-white transition-colors"
+                      placeholder="e.g. srisaravanabhavan57.com"
+                    />
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5 pt-1">
+                  <div>
+                    <label className="block text-xs font-bold text-slate-300 mb-1">
+                      GSTIN Number (Optional)
+                    </label>
+                    <input
+                      type="text"
+                      value={formData.gstNumber || ''}
+                      onChange={(e) => setFormData({ ...formData, gstNumber: e.target.value })}
+                      className="w-full bg-slate-950 border border-slate-700 focus:border-amber-500 focus:ring-1 focus:ring-amber-500 rounded-xl px-3.5 py-2 text-xs text-white font-mono transition-colors uppercase"
+                      placeholder="e.g. 33AABCS1429B1Z"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-bold text-slate-300 mb-1">
+                      FSSAI License No. (Optional)
+                    </label>
+                    <input
+                      type="text"
+                      value={formData.fssaiNumber || ''}
+                      onChange={(e) => setFormData({ ...formData, fssaiNumber: e.target.value })}
+                      className="w-full bg-slate-950 border border-slate-700 focus:border-amber-500 focus:ring-1 focus:ring-amber-500 rounded-xl px-3.5 py-2 text-xs text-white font-mono transition-colors"
+                      placeholder="e.g. 12423002000456"
+                    />
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Tab 2: Centralized Receipt Logo & Watermark Processor */}
+          {activeTab === 'logo' && (
+            <CentralizedLogoProcessor
+              settings={formData}
+              onUpdateSettings={setFormData}
+              onSave={handleSave}
+              isSaving={saving}
+            />
+          )}
+
+          {/* Tab 3: Receipt Designer, Formats, Spacing & Alignment */}
+          {activeTab === 'receipt' && (
+            <div className="space-y-5">
+              {/* Paper Dimensions & Hardware Model Presets */}
+              <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-lg space-y-4">
+                <div className="flex items-center justify-between pb-3 border-b border-slate-800">
+                  <div className="flex items-center gap-2.5">
+                    <Printer className="w-5 h-5 text-amber-400" />
+                    <div>
+                      <h3 className="font-bold text-sm text-white">Printer Width &amp; Shift Settings</h3>
+                      <p className="text-xs text-slate-400">Roll size (80mm / 58mm) and daily business reset time</p>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Paper Width Selector */}
+                <div className="space-y-2">
+                  <label className="text-xs font-bold text-slate-300 block">Thermal Paper Roll Width</label>
+                  <div className="grid grid-cols-2 gap-3">
+                    <button
+                      type="button"
+                      onClick={() => setFormData(prev => ({ ...prev, paperWidth: '80mm', printerType: 'THERMAL_80MM' }))}
+                      className={`p-3.5 rounded-xl border text-left transition-all cursor-pointer ${
+                        formData.paperWidth === '80mm'
+                          ? 'bg-amber-500/15 border-amber-500/80 text-white shadow-xs'
+                          : 'bg-slate-950 border-slate-800 hover:border-slate-700 text-slate-400'
+                      }`}
+                    >
+                      <div className="font-bold text-xs text-white">80mm (3-Inch Standard)</div>
+                      <div className="text-[11px] text-slate-400 mt-0.5">72mm printable width • Best for POS counters</div>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => setFormData(prev => ({ ...prev, paperWidth: '58mm', printerType: 'THERMAL_58MM' }))}
+                      className={`p-3.5 rounded-xl border text-left transition-all cursor-pointer ${
+                        formData.paperWidth === '58mm'
+                          ? 'bg-amber-500/15 border-amber-500/80 text-white shadow-xs'
+                          : 'bg-slate-950 border-slate-800 hover:border-slate-700 text-slate-400'
+                      }`}
+                    >
+                      <div className="font-bold text-xs text-white">58mm (2-Inch Portable)</div>
+                      <div className="text-[11px] text-slate-400 mt-0.5">48mm printable width • Portable Bluetooth printers</div>
+                    </button>
+                  </div>
+                </div>
+
+                {/* Business Day & Digits */}
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1 border-t border-slate-800/80">
+                  <div>
+                    <label className="block text-xs font-bold text-slate-300 mb-1">
+                      Shift / Business Day Start
+                    </label>
+                    <input
+                      type="time"
+                      value={formData.businessDayStartHour || '04:00'}
+                      onChange={(e) => setFormData(prev => ({ ...prev, businessDayStartHour: e.target.value }))}
+                      className="w-full bg-slate-950 border border-slate-700 focus:border-amber-500 focus:ring-1 focus:ring-amber-500 rounded-xl px-3.5 py-2 text-xs text-white font-mono transition-colors"
+                    />
+                    <p className="text-[11px] text-slate-500 mt-1">Daily bill counter resets automatically at this hour</p>
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-bold text-slate-300 mb-1">
+                      Bill Number Digits
+                    </label>
+                    <select
+                      value={formData.billNumberDigits || 2}
+                      onChange={(e) => setFormData(prev => ({ ...prev, billNumberDigits: Number(e.target.value) }))}
+                      className="w-full bg-slate-950 border border-slate-700 focus:border-amber-500 focus:ring-1 focus:ring-amber-500 rounded-xl px-3.5 py-2 text-xs text-white transition-colors"
+                    >
+                      <option value={1}>1 Digit (1, 2, 3...)</option>
+                      <option value={2}>2 Digits (01, 02, 03...)</option>
+                      <option value={3}>3 Digits (001, 002...)</option>
+                      <option value={4}>4 Digits (0001, 0002...)</option>
+                    </select>
+                  </div>
+                </div>
+              </div>
+
+              {/* Comprehensive Receipt Designer: Formats, Font Sizes, Alignment & Spacing */}
+              <ReceiptDesignerSection
+                formData={formData}
+                setFormData={setFormData}
+                onSave={() => handleSave()}
+                isSaving={saving}
+              />
+            </div>
+          )}
+
+          {/* Tab 4: Hardware, Automation & Database Seeder */}
+          {activeTab === 'hardware' && (
+            <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-lg space-y-4">
+              <div className="flex items-center gap-2.5 pb-3 border-b border-slate-800">
+                <Printer className="w-5 h-5 text-amber-400" />
+                <div>
+                  <h3 className="font-bold text-sm text-white">Hardware Calibration & System Tools</h3>
+                  <p className="text-xs text-slate-400">Printer test slips, fast cashier printing, and menu seeder</p>
+                </div>
+              </div>
+
+              {/* Automation Toggles */}
+              <div className="space-y-4 bg-slate-950 border border-slate-800 rounded-xl p-4">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <div className="font-bold text-xs text-slate-200">Auto-Print on Bill Save</div>
+                    <div className="text-[11px] text-slate-500">Automatically trigger thermal print when cashier finishes payment</div>
+                  </div>
+                  <input
+                    type="checkbox"
+                    id="checkbox-auto-print-save"
+                    checked={Boolean(formData.autoPrintOnSave)}
+                    onChange={(e) => setFormData({ ...formData, autoPrintOnSave: e.target.checked })}
+                    className="w-4 h-4 accent-amber-500 rounded cursor-pointer"
+                  />
+                </div>
+
+                <div className="border-t border-slate-900 pt-3 flex items-center justify-between">
+                  <div className="pr-4">
+                    <div className="font-bold text-xs text-slate-200 flex items-center gap-2">
+                      <span>Skip On-Screen Print Preview (Express Checkout)</span>
+                      <span className="px-1.5 py-0.5 rounded text-[10px] font-extrabold uppercase bg-emerald-500/20 text-emerald-400 border border-emerald-500/30">
+                        ⚡ Fast Mode
+                      </span>
+                    </div>
+                    <div className="text-[11px] text-slate-400 mt-0.5">
+                      Bypasses the on-screen receipt modal. The POS cart resets instantly for the next customer without interrupting the cashier.
+                    </div>
+                  </div>
+                  <input
+                    type="checkbox"
+                    id="checkbox-skip-print-preview"
+                    checked={Boolean(formData.skipPrintPreview)}
+                    onChange={(e) => setFormData({ ...formData, skipPrintPreview: e.target.checked })}
+                    className="w-4 h-4 accent-emerald-500 rounded cursor-pointer shrink-0"
+                  />
+                </div>
+
+                <div className="p-4 bg-slate-900/90 border border-amber-500/30 rounded-xl text-[11px] text-slate-300 space-y-2.5">
+                  <div className="font-bold text-xs text-amber-400 flex items-center gap-2">
+                    <Zap className="w-4 h-4" />
+                    <span>Google Chrome Kiosk Printing Setup (Silent 0-Click Thermal Printing)</span>
+                  </div>
+                  <p className="text-slate-400 leading-relaxed">
+                    To print bills and KOT slips directly to your thermal printer with <strong>NO print preview dialog</strong> and <strong>NO confirmation popup</strong>, configure Windows and launch Chrome with the <code className="text-amber-300 bg-slate-950 px-1.5 py-0.5 rounded font-mono">--kiosk-printing</code> flag.
+                  </p>
+
+                  <div className="space-y-1.5 pt-1">
+                    <div className="font-semibold text-slate-200">Step 1: Set Thermal Printer as Windows Default Printer</div>
+                    <div className="text-slate-400 pl-3 border-l-2 border-slate-700">
+                      Open <em>Windows Settings → Bluetooth & Devices → Printers & Scanners</em>. Select your thermal printer (e.g., Rugtek RP326 / POS-80 / TVS) and click <strong>"Set as default"</strong>. Ensure Paper Size is set to 80mm (or 58mm) and Margins are set to None.
+                    </div>
+                  </div>
+
+                  <div className="space-y-1.5 pt-1">
+                    <div className="font-semibold text-slate-200">Step 2: Create Windows Chrome Kiosk Shortcut</div>
+                    <div className="text-slate-400 pl-3 border-l-2 border-slate-700 space-y-1">
+                      <div>Right-click your desktop → <em>New → Shortcut</em>, and paste the following target:</div>
+                      <div className="flex items-center gap-2 mt-1">
+                        <code className="bg-slate-950 border border-slate-800 text-emerald-400 px-2.5 py-1.5 rounded font-mono text-[11px] flex-1 select-all break-all">
+                          "C:\Program Files\Google\Chrome\Application\chrome.exe" --kiosk-printing "{typeof window !== 'undefined' ? window.location.origin : 'http://localhost:3000'}"
+                        </code>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const cmd = `"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" --kiosk-printing "${typeof window !== 'undefined' ? window.location.origin : 'http://localhost:3000'}"`;
+                            navigator.clipboard.writeText(cmd);
+                            setNotification({ type: 'success', message: 'Kiosk shortcut command copied to clipboard!' });
+                            setTimeout(() => setNotification(null), 3000);
+                          }}
+                          className="px-2.5 py-1.5 bg-amber-500 hover:bg-amber-600 active:bg-amber-700 text-white font-bold rounded-lg cursor-pointer shrink-0 transition-colors text-[10px]"
+                          title="Copy shortcut target command"
+                        >
+                          Copy
+                        </button>
+                      </div>
+                      <div className="text-[10px] text-slate-400 mt-1">
+                        * Note: If Chrome is installed in 32-bit directory, use: <code className="text-slate-300 font-mono">"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"</code>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Rugtek RP326 Web Serial & WebUSB Hardware Pairing Section */}
+              <RugtekPrinterPairingSection 
+                settings={formData} 
+                onUpdateSettings={(updated) => setFormData(prev => ({ ...prev, ...updated }))} 
+              />
+
+              {/* Hardware Test Buttons */}
+              <div className="space-y-2">
+                <label className="text-xs font-bold text-slate-300 block">Printer Hardware Calibration</label>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  {/* Primary Diagnostic Raw ESC/POS Print Test */}
+                  <button
+                    type="button"
+                    id="btn-diagnostic-raw-escpos-test"
+                    onClick={() => setShowRawEscPosModal(true)}
+                    className="p-3 bg-gradient-to-r from-amber-500/15 via-slate-950 to-slate-900 hover:from-amber-500/25 hover:to-slate-850 border border-amber-500/40 rounded-xl text-left transition-all cursor-pointer flex items-center gap-3 sm:col-span-2 shadow-sm"
+                  >
+                    <div className="w-10 h-10 rounded-xl bg-amber-500/20 text-amber-400 border border-amber-500/40 flex items-center justify-center shrink-0">
+                      <Terminal className="w-5 h-5" />
+                    </div>
+                    <div className="flex-1">
+                      <div className="text-xs font-bold text-slate-100 flex items-center gap-2">
+                        <span>Diagnostic Raw ESC/POS Print Test</span>
+                        <span className="px-2 py-0.5 rounded text-[10px] font-extrabold uppercase bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 font-mono">
+                          BYPASS DIALOG
+                        </span>
+                        <span className="px-2 py-0.5 rounded text-[10px] font-extrabold uppercase bg-amber-500/20 text-amber-400 border border-amber-500/30 font-mono">
+                          HARDWARE HANDSHAKE
+                        </span>
+                      </div>
+                      <div className="text-[11px] text-slate-400 mt-0.5 leading-normal">
+                        Generates a small binary ESC/POS command stream to verify hardware handshake, character set support, bold/inverse styles &amp; partial auto-cut independently of the browser print dialog.
+                      </div>
+                    </div>
+                    <Zap className="w-4 h-4 text-amber-400 shrink-0" />
+                  </button>
+
+                  <button
+                    type="button"
+                    id="btn-print-test-page-hardware"
+                    onClick={handleTriggerTestPrint}
+                    disabled={isTestingPrint}
+                    className="p-3.5 bg-slate-950 hover:bg-slate-850 border border-amber-500/30 hover:border-amber-500/60 rounded-xl text-left transition-all cursor-pointer flex items-start gap-3 sm:col-span-2 group"
+                  >
+                    <div className="w-9 h-9 rounded-lg bg-amber-500/10 border border-amber-500/30 flex items-center justify-center shrink-0 text-amber-400 group-hover:scale-105 transition-transform mt-0.5">
+                      <Printer className="w-5 h-5" />
+                    </div>
+                    <div className="flex-1">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="text-xs font-bold text-amber-200">Print Test Page</span>
+                        <span className="text-[10px] px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-mono font-bold">
+                          VERIFY CONNECTION & PAPER FEED
+                        </span>
+                      </div>
+                      <div className="text-[11px] text-slate-400 mt-1 leading-normal">
+                        Sends a standardized diagnostic string to the default thermal printer to verify connection, character set support, and 20mm paper feed status immediately.
+                      </div>
+                    </div>
+                    <span className="text-xs font-bold text-amber-400 self-center shrink-0 px-3 py-1.5 bg-amber-500/10 rounded-lg border border-amber-500/30 group-hover:bg-amber-500/20 transition-colors">
+                      {isTestingPrint ? 'Sending...' : 'Print Now'}
+                    </span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => setShowTestPrintModal(true)}
+                    className="p-3 bg-slate-950 hover:bg-slate-800 border border-slate-800 rounded-xl text-left transition-all cursor-pointer flex items-center gap-2.5 sm:col-span-2"
+                  >
+                    <Eye className="w-5 h-5 text-emerald-400 shrink-0" />
+                    <div>
+                      <div className="text-xs font-bold text-slate-200">Preview Standardized Test Page</div>
+                      <div className="text-[10px] text-slate-500">Inspect the diagnostic string, character grid, and paper feed marks before dispatching to physical printer</div>
+                    </div>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => setShowTroubleshootModal(true)}
+                    className="p-3 bg-slate-950 hover:bg-slate-800 border border-slate-800 rounded-xl text-left transition-all cursor-pointer flex items-center gap-2.5 sm:col-span-2"
+                  >
+                    <Sliders className="w-5 h-5 text-amber-400 shrink-0" />
+                    <div>
+                      <div className="text-xs font-bold text-slate-200">Printer Connection Wizard &amp; Hardware Setup Guide</div>
+                      <div className="text-[10px] text-slate-500">Connect USB, Serial, Bluetooth, network or OS printers + Kiosk instant-print command</div>
+                    </div>
+                  </button>
+
+                  <button
+                    type="button"
+                    id="btn-goto-printer-diagnostic"
+                    onClick={() => setActiveTab('diagnostic')}
+                    className="p-3 bg-slate-950 hover:bg-slate-800 border border-amber-500/30 rounded-xl text-left transition-all cursor-pointer flex items-center gap-2.5 sm:col-span-2 bg-amber-500/5"
+                  >
+                    <Activity className="w-5 h-5 text-amber-400 shrink-0" />
+                    <div className="flex-1">
+                      <div className="text-xs font-bold text-amber-300 flex items-center gap-2">
+                        <span>Open Full Printer Diagnostic View</span>
+                        <span className="px-1.5 py-0.2 rounded bg-amber-500/20 text-amber-400 text-[10px] font-mono font-bold">LIVE CHECK</span>
+                      </div>
+                      <div className="text-[10px] text-slate-400">
+                        Checks browser window.print(), WebUSB / Serial APIs, sandboxed status, and displays comprehensive thermal POS setup guides
+                      </div>
+                    </div>
+                  </button>
+                </div>
+              </div>
+
+              {/* Menu & Catalog Seeder */}
+              <div className="bg-slate-950 border border-slate-800 rounded-xl p-4 space-y-3">
+                <div className="flex items-center gap-2 font-bold text-xs text-slate-200">
+                  <Database className="w-4 h-4 text-emerald-400" />
+                  <span>Menu & System Catalog Seeder</span>
+                </div>
+                <p className="text-[11px] text-slate-400 leading-relaxed">
+                  Populates categories and popular items (Dosa, Idli, Pongal, Meals, Coffee, Tea) into Firestore.
+                </p>
+                <button
+                  type="button"
+                  onClick={handleRunBootstrap}
+                  disabled={bootstrapping}
+                  className="w-full py-2.5 px-4 bg-emerald-600 hover:bg-emerald-500 active:bg-emerald-700 disabled:opacity-50 text-white font-bold rounded-xl flex items-center justify-center gap-2 transition-colors cursor-pointer shadow-sm text-xs"
+                >
+                  <Sparkles className={`w-4 h-4 ${bootstrapping ? 'animate-spin' : ''}`} />
+                  <span>{bootstrapping ? 'Seeding Database...' : 'Seed Sample Menu & Categories'}</span>
+                </button>
+              </div>
+
+              {/* Automated Daily Database Backup & Billing Archives Component */}
+              <DailyBackupSettingsCard settings={formData} onRefreshSettings={onRefreshSettings} />
+
+              {/* Diagnostics Toggle */}
+              <div>
+                <button
+                  type="button"
+                  onClick={() => setShowDiagnostics(!showDiagnostics)}
+                  className="text-xs text-slate-400 hover:text-slate-200 flex items-center gap-1.5 font-medium cursor-pointer"
+                >
+                  <Activity className="w-3.5 h-3.5 text-amber-400" />
+                  <span>{showDiagnostics ? 'Hide Print Diagnostic Logs' : 'Show Print Diagnostic Logs & Status'}</span>
+                  {showDiagnostics ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* Collapsible Diagnostics Card */}
+          {showDiagnostics && (
+            <div className="mt-1 space-y-5">
+              <TestPrintLog settings={formData} onRunTestPrint={handleTriggerTestPrint} />
+              <PrintDiagnosticsCard settings={formData} />
+            </div>
+          )}
+
+          {/* Tab 5: Printer Diagnostic & POS Hardware Setup View */}
+          {activeTab === 'diagnostic' && (
+            <div className="animate-fadeIn">
+              <PrinterDiagnosticView 
+                settings={formData} 
+                onOpenTestModal={() => setShowTestPrintModal(true)} 
+                onUpdateSettings={(updated) => setFormData(prev => ({ ...prev, ...updated }))}
+              />
+            </div>
+          )}
+
+        </div>
+
+        {/* Right Column: Live Sticky Real-Time Interactive Receipt Preview (5 cols) */}
+        <div className="lg:col-span-5 sticky top-4 flex flex-col gap-3">
+          <LiveReceiptPreview
+            settings={formData}
+            onTestPrint={handlePrintSampleReceipt}
+            isPrintingSample={isPrintingSample}
+          />
         </div>
 
       </div>
 
+      {/* Test Print Hardware & Alignment Preview Modal */}
+      <TestPrintModal
+        isOpen={showTestPrintModal}
+        onClose={() => setShowTestPrintModal(false)}
+        settings={formData}
+        onPrintSuccess={() => {
+          setNotification({ type: 'success', message: 'Diagnostic test slip dispatched to thermal printer!' });
+          setTimeout(() => setNotification(null), 3000);
+        }}
+      />
+
+      {/* Raw ESC/POS Binary Diagnostic & Handshake Modal */}
+      <RawEscPosTestModal
+        isOpen={showRawEscPosModal}
+        onClose={() => setShowRawEscPosModal(false)}
+        settings={formData}
+      />
+
+      {/* Printer Troubleshooting & Setup Guide Modal */}
+      <PrinterTroubleshootModal
+        isOpen={showTroubleshootModal}
+        onClose={() => setShowTroubleshootModal(false)}
+        settings={formData}
+      />
+
     </div>
   );
 };
-

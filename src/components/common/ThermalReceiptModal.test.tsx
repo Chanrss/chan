@@ -7,7 +7,9 @@ import { PrinterService } from '../../services/printerService';
 
 vi.mock('../../services/printerService', () => ({
   PrinterService: {
-    printBill: vi.fn()
+    printBill: vi.fn(),
+    setPrintRootLogoSize: vi.fn(),
+    getPrintRootLogoSize: vi.fn(() => ({ width: 140, height: 50 }))
   }
 }));
 
@@ -92,10 +94,11 @@ describe('ThermalReceiptModal Component', () => {
       />
     );
 
-    expect(screen.getByText(/Bill #55/i)).toBeInTheDocument();
-    expect(screen.getByText('Sri Saravana Bhavan')).toBeInTheDocument();
-    expect(screen.getByText(/T-09/i)).toBeInTheDocument();
-    expect(screen.getByText('₹90')).toBeInTheDocument();
+    expect(screen.getByText(/Bill #55/i)).toBeDefined();
+    expect(screen.getByText('ஸ்ரீ சரவண பவன்')).toBeDefined();
+    expect(screen.queryByText('Sri Saravana Bhavan')).toBeNull();
+    expect(screen.getByText(/T-09/i)).toBeDefined();
+    expect(screen.getByText('₹90')).toBeDefined();
   });
 
   it('calls onClose when close button is clicked', () => {
@@ -151,6 +154,31 @@ describe('ThermalReceiptModal Component', () => {
       />
     );
 
-    expect(screen.getByText(/DUPLICATE \/ REPRINT/i)).toBeInTheDocument();
+    expect(screen.getByText(/DUPLICATE \/ REPRINT/i)).toBeDefined();
+  });
+
+  it('renders logo scaling control panel and updates print root logo size', () => {
+    render(
+      <ThermalReceiptModal
+        isOpen={true}
+        bill={sampleBill}
+        items={sampleItems}
+        settings={{
+          ...sampleSettings,
+          logoDisplay: 'header',
+          receiptLogoMaxWidth: 160,
+          receiptLogoMaxHeight: 55
+        }}
+        onClose={vi.fn()}
+      />
+    );
+
+    // Verify logo size control panel is rendered
+    expect(screen.getByText(/Logo Scaling & 80mm Paper Fit/i)).toBeDefined();
+    expect(screen.getByText(/Max Width/i)).toBeDefined();
+    expect(screen.getByText(/Max Height/i)).toBeDefined();
+
+    // Verify PrinterService.setPrintRootLogoSize was called
+    expect(PrinterService.setPrintRootLogoSize).toHaveBeenCalledWith(160, 55);
   });
 });
